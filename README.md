@@ -12,14 +12,20 @@
 
 ## 构建与运行
 
+克隆时需带上 submodule（内含打过补丁的 `webrtc*` vendor，与 [uu-remote-linux](https://github.com/VallierDev/uu-remote-linux) 一致）：
+
+```sh
+git clone --recurse-submodules https://github.com/ArnoChenFx/uu-minimal.git
+# 已有仓库：git submodule update --init --recursive
+# 跟进主程序 vendor 更新：git submodule update --remote vendor-src
+```
+
 ```sh
 cargo build --release
 ./target/release/uu-minimal help      # 命令与选项
 ./target/release/uu-minimal login     # 二维码只打到当前终端
 ./target/release/uu-minimal run
 ```
-
-要在主程序仓库的 `minimal/` 位置编译：`Cargo.toml` 的 `[patch.crates-io]` 指向 `../vendor/webrtc*`（打过补丁的 webrtc），单独拷出来编译需要一并带上。
 
 日志默认本程序 `info`，`webrtc*` / `russh` 压到 `warn`。`ssh` / `sftp` / `tunnel` 默认静音（独占终端）。`RUST_LOG` 优先，例如 `RUST_LOG=info,webrtc_ice=debug`；`NO_COLOR=1` 关颜色。
 
