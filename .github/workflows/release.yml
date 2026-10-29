@@ -89,6 +89,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
+        env:
+          UU_MINIMAL_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           if [ -n "${{ matrix.target }}" ]; then
