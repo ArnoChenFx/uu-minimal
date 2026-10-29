@@ -2,5 +2,6 @@
 
 pub mod ice;
 pub mod peer;
+pub(crate) mod retry;
 pub mod signaling;
 pub mod viewer;

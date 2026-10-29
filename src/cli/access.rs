@@ -76,7 +76,7 @@ pub async fn portmap_run_bind(device: &str, bind: &str, local: u16, host: &str, 
 
 /// 多条本地映射共享一次 `join`（同一 device 只能有一条 viewer WebRTC；多进程 portmap 会互相 force_join）。
 /// `bind` 可选：`--bind 0.0.0.0` 让局域网其它机器也能连入。
-/// WebRTC 断线自动重连，指数退避 1s→30s。
+/// WebRTC 断线自动重连，失败后从 0.5s 开始退避，最多 30s。
 pub async fn portmap_run_rules(
     device: &str,
     bind: &str,
@@ -86,8 +86,6 @@ pub async fn portmap_run_rules(
         return Err("至少一条端口映射".into());
     }
     use std::net::IpAddr;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
 
     let bind_addr: IpAddr = bind
         .parse()
@@ -97,70 +95,76 @@ pub async fn portmap_run_rules(
 
     // 会话槽：None = 正在重连；重连只在这里发生，accept 循环永远不退出。
     let session: Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>> = Arc::new(tokio::sync::RwLock::new(None));
-    let backoff = Arc::new(AtomicU64::new(1));
+    let session_ready = Arc::new(tokio::sync::Notify::new());
 
     async fn connect(
         api: &Arc<Api>,
         device: &str,
         session: &Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>>,
-        backoff: &Arc<AtomicU64>,
+        session_ready: &tokio::sync::Notify,
     ) {
+        let mut backoff = crate::net::retry::Backoff::new();
+        let started = std::time::Instant::now();
+        let mut attempts = 0;
         loop {
+            attempts += 1;
             match viewer::join(api, device, viewer::signal::CAPTURE_PORT_MAP).await {
                 Ok(s) => {
                     *session.write().await = Some(s.peer);
-                    let secs = backoff.load(Ordering::Relaxed);
-                    backoff.store(1, Ordering::Relaxed);
+                    session_ready.notify_one();
                     println!("{}", ui::bold("链路已连接"));
-                    if secs > 1 {
-                        println!("  （此前重连等待 {secs}s）");
+                    if attempts > 1 {
+                        println!("  （本轮尝试 {attempts} 次，耗时 {}ms）", started.elapsed().as_millis());
                     }
                     return;
                 }
                 Err(e) => {
-                    let secs = backoff.load(Ordering::Relaxed).min(30);
-                    log::warn!("连接失败（{secs}s 后重试）: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                    backoff.store((secs * 2).max(2).min(30), Ordering::Relaxed);
+                    let delay = backoff.delay();
+                    log::warn!("连接失败（{}ms 后重试）: {e}", delay.as_millis());
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
     }
 
-    // 后台监控：会话存在但 DataChannel 已关，摘掉它并重连。
+    // 后台监控：状态回调唤醒硬断线处理，探测只负责识别仍显示 Open 的假在线。
     {
         let session = session.clone();
         let api = api.clone();
-        let backoff = backoff.clone();
+        let session_ready = session_ready.clone();
         let device = device.clone();
         tokio::spawn(async move {
-            let mut since_ping = std::time::Instant::now();
-            let mut missed_pings = 0u8;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let peer = session.read().await.clone();
-                let Some(peer) = peer else { continue };
-                // 每 20s 一条探测流：刷新 TURN 租约 / NAT 映射 / SCTP 状态，
-                // 避免空闲链路被中间设备悄悄回收。
-                let mut reconnect = peer.transport_closed();
-                if !reconnect && since_ping.elapsed() >= std::time::Duration::from_secs(20) {
-                    since_ping = std::time::Instant::now();
-                    if peer.keepalive_ping().await {
-                        missed_pings = 0;
-                    } else {
-                        missed_pings += 1;
-                        log::warn!("链路探测未收到回包: consecutive_failures={missed_pings}");
+                let peer = loop {
+                    let ready = session_ready.notified();
+                    if let Some(peer) = session.read().await.clone() { break peer; }
+                    ready.await;
+                };
+                let mut missed_pings = 0u8;
+                let period = std::time::Duration::from_secs(20);
+                let mut probes = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = peer.wait_transport_closed() => break,
+                        _ = probes.tick() => {
+                            match peer.probe_or_closed().await {
+                                None => break,
+                                Some(true) => missed_pings = 0,
+                                Some(false) => {
+                                    missed_pings += 1;
+                                    log::warn!("链路探测未收到回包: consecutive_failures={missed_pings}");
+                                }
+                            }
+                            if missed_pings >= 3 { break; }
+                        }
                     }
-                    reconnect = missed_pings >= 3 || peer.transport_closed();
                 }
-                if reconnect {
-                    *session.write().await = None;
-                    log::warn!("链路已断开，准备重连");
-                    peer.close().await;
-                    connect(&api, &device, &session, &backoff).await;
-                    missed_pings = 0;
-                    since_ping = std::time::Instant::now();
-                }
+                *session.write().await = None;
+                log::warn!("链路已断开，准备重连");
+                peer.close().await;
+                connect(&api, &device, &session, &session_ready).await;
             }
         });
     }
@@ -173,7 +177,7 @@ pub async fn portmap_run_rules(
         ui::hint("  注意: 监听所有网卡，本机所在网络的其它设备均可使用此隧道");
     }
     ui::hint("  Ctrl-C 退出；链路断开会自动重连");
-    connect(&api, &device, &session, &backoff).await;
+    connect(&api, &device, &session, &session_ready).await;
 
     for (local, host, port) in rules {
         let listener = tokio::net::TcpListener::bind((bind_addr, *local))
