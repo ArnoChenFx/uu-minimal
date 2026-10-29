@@ -1,5 +1,7 @@
 //! 控制端工具：`portmap` / `ssh` / `sftp` / `tunnel`。
 
+use std::sync::Arc;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::cli::args::Args;
@@ -13,27 +15,76 @@ use crate::net::viewer::{self, rtc::FlowHandle, ssh as russh_client};
 pub async fn portmap_command(args: &[String]) -> Result<(), String> {
     let args = Args::new(args);
     let device = args.require_device()?;
+    let bind = args.value("--bind").unwrap_or("127.0.0.1").to_owned();
+    let rules = parse_portmap_rules(&args)?;
+    portmap_run_rules(device, &bind, &rules).await
+}
+
+fn parse_portmap_rule(spec: &str) -> Result<(u16, String, u16), String> {
+    let mut parts = spec.splitn(3, ',');
+    let local: u16 = parts
+        .next()
+        .ok_or_else(|| format!("--map 格式应为 本地端口,目标主机,目标端口: {spec}"))?
+        .trim()
+        .parse()
+        .map_err(|_| format!("--map 本地端口无效: {spec}"))?;
+    let host = parts
+        .next()
+        .ok_or_else(|| format!("--map 缺少目标主机: {spec}"))?
+        .trim()
+        .to_owned();
+    let port: u16 = parts
+        .next()
+        .ok_or_else(|| format!("--map 缺少目标端口: {spec}"))?
+        .trim()
+        .parse()
+        .map_err(|_| format!("--map 目标端口无效: {spec}"))?;
+    if host.is_empty() {
+        return Err(format!("--map 目标主机不能为空: {spec}"));
+    }
+    Ok((local, host, port))
+}
+
+fn parse_portmap_rules(args: &Args<'_>) -> Result<Vec<(u16, String, u16)>, String> {
+    let maps: Vec<_> = args.values("--map").into_iter().map(parse_portmap_rule).collect::<Result<_, _>>()?;
+    if !maps.is_empty() {
+        return Ok(maps);
+    }
     let positional = args.positionals();
     if positional.len() != 3 {
         return Err(
-            "用法: uu-minimal portmap --device <id> [--bind 127.0.0.1|0.0.0.0|…] \
-             <本地端口> <目标主机> <目标端口>"
+            "用法: uu-minimal portmap --device <id> [--bind 地址] <本地端口> <目标主机> <目标端口>\n\
+             或多条映射（共享一条 WebRTC，可开多个本地端口）:\n\
+               uu-minimal portmap --device <id> [--bind 地址] \\\n\
+                 --map 2222,127.0.0.1,22 --map 3389,192.168.0.10,3389\n\
+             同一 --device 不要开两个 portmap 进程（会 force_join 互相顶掉）；多端口请用多个 --map。"
                 .into(),
         );
     }
     let local: u16 = positional[0].parse().map_err(|_| "本地端口无效".to_string())?;
     let port: u16 = positional[2].parse().map_err(|_| "目标端口无效".to_string())?;
-    let bind = args.value("--bind").unwrap_or("127.0.0.1").to_owned();
-    portmap_run_bind(device, &bind, local, positional[1], port).await
+    Ok(vec![(local, positional[1].to_owned(), port)])
 }
 
 pub async fn portmap_run(device: &str, local: u16, host: &str, port: u16) -> Result<(), String> {
     portmap_run_bind(device, "127.0.0.1", local, host, port).await
 }
 
-/// `bind` 可选：`--bind 0.0.0.0`（或任意地址）让局域网其它机器也能连入。
-/// WebRTC 链路断掉后（DataChannel 关闭）自动重连，指数退避 1s→30s 封顶，恢复后继续服务。
 pub async fn portmap_run_bind(device: &str, bind: &str, local: u16, host: &str, port: u16) -> Result<(), String> {
+    portmap_run_rules(device, bind, &[(local, host.to_owned(), port)]).await
+}
+
+/// 多条本地映射共享一次 `join`（同一 device 只能有一条 viewer WebRTC；多进程 portmap 会互相 force_join）。
+/// `bind` 可选：`--bind 0.0.0.0` 让局域网其它机器也能连入。
+/// WebRTC 断线自动重连，指数退避 1s→30s。
+pub async fn portmap_run_rules(
+    device: &str,
+    bind: &str,
+    rules: &[(u16, String, u16)],
+) -> Result<(), String> {
+    if rules.is_empty() {
+        return Err("至少一条端口映射".into());
+    }
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -41,7 +92,6 @@ pub async fn portmap_run_bind(device: &str, bind: &str, local: u16, host: &str, 
     let bind_addr: IpAddr = bind
         .parse()
         .map_err(|_| format!("监听地址无效: {bind}（示例: 127.0.0.1 或 0.0.0.0）"))?;
-    let host = host.to_owned();
     let device = Arc::new(device.to_owned());
     let api = Arc::new(loaded_api()?);
 
@@ -104,44 +154,63 @@ pub async fn portmap_run_bind(device: &str, bind: &str, local: u16, host: &str, 
         });
     }
 
-    let listener = tokio::net::TcpListener::bind((bind_addr, local))
-        .await
-        .map_err(|e| format!("监听 {bind}:{local} 失败: {e}"))?;
     println!("{}", ui::bold("隧道就绪"));
-    println!("  {bind}:{local} → {host}:{port}");
+    for (local, host, port) in rules {
+        println!("  {bind}:{local} → {host}:{port}");
+    }
     if bind == "0.0.0.0" || bind == "::" {
         ui::hint("  注意: 监听所有网卡，本机所在网络的其它设备均可使用此隧道");
     }
     ui::hint("  Ctrl-C 退出；链路断开会自动重连");
     connect(&api, &device, &session, &backoff).await;
-    loop {
-        let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+
+    for (local, host, port) in rules {
+        let listener = tokio::net::TcpListener::bind((bind_addr, *local))
+            .await
+            .map_err(|e| format!("监听 {bind}:{local} 失败: {e}"))?;
         let session = session.clone();
         let host = host.clone();
+        let port = *port;
         tokio::spawn(async move {
-            // 短暂自旋等待重连中的会话恢复（最多 ~10s），避免断链瞬间的连接直接失败。
-            for _ in 0..20 {
-                let peer = session.read().await.clone();
-                if let Some(peer) = peer {
-                    match peer.open_flow(&host, port).await {
-                        Ok(flow) => {
-                            pump_socket(socket, flow).await;
-                            return;
-                        }
-                        Err(e) if e.contains("not opened") => {
-                            // 通道已死：等监控线程重连，继续等下一轮。
-                        }
-                        Err(e) => {
-                            log::warn!("打开流失败: {e}");
-                            return;
-                        }
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            loop {
+                let Ok((socket, _)) = listener.accept().await else { break };
+                let session = session.clone();
+                let host = host.clone();
+                tokio::spawn(async move {
+                    accept_portmap_stream(session, &host, port, socket).await;
+                });
             }
-            log::warn!("连接在等待链路恢复时超时，已断开本地连接");
         });
     }
+
+    tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn accept_portmap_stream(
+    session: Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>>,
+    host: &str,
+    port: u16,
+    socket: tokio::net::TcpStream,
+) {
+    for _ in 0..20 {
+        let peer = session.read().await.clone();
+        if let Some(peer) = peer {
+            match peer.open_flow(host, port).await {
+                Ok(flow) => {
+                    pump_socket(socket, flow).await;
+                    return;
+                }
+                Err(e) if e.contains("not opened") => {}
+                Err(e) => {
+                    log::warn!("打开流失败: {e}");
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    log::warn!("连接在等待链路恢复时超时，已断开本地连接");
 }
 
 /// 内嵌 SSH（russh）：一条端口映射流直接当 socket，不碰 `~/.ssh/config`。
