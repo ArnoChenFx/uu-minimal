@@ -3829,6 +3829,8 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fbdf025f0fa62f4bf252b2fb0cff0a04d3eac2021c440096649e62f4e48553d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3884,6 +3886,8 @@ dependencies = [
 [[package]]
 name = "webrtc-dtls"
 version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "188ce061a2371bdf4df54b136c89a6df243ed0ef6b03431b4bd18482cd718dfe"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -3985,6 +3989,8 @@ dependencies = [
 [[package]]
 name = "webrtc-srtp"
 version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383b0f0f73ee6cce396bdbc4d54ec661861a59eae9fc988914c1a8d82c5ac272"
 dependencies = [
  "aead 0.5.2",
  "aes 0.8.4",

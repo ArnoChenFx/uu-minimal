@@ -264,11 +264,13 @@ fn append_pin(store: &Path, host: &str, port: u16, fingerprint: &str) {
 }
 
 /// 本地终端 raw 模式，Drop 时恢复。
+#[cfg(unix)]
 struct RawMode {
     saved: libc::termios,
     active: bool,
 }
 
+#[cfg(unix)]
 impl RawMode {
     fn enable() -> Self {
         unsafe {
@@ -284,6 +286,7 @@ impl RawMode {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
         if self.active {
@@ -294,6 +297,17 @@ impl Drop for RawMode {
     }
 }
 
+#[cfg(not(unix))]
+struct RawMode;
+
+#[cfg(not(unix))]
+impl RawMode {
+    fn enable() -> Self {
+        Self
+    }
+}
+
+#[cfg(unix)]
 fn window_size() -> (u32, u32) {
     unsafe {
         let mut size: libc::winsize = std::mem::zeroed();
@@ -305,6 +319,11 @@ fn window_size() -> (u32, u32) {
     }
 }
 
+#[cfg(not(unix))]
+fn window_size() -> (u32, u32) {
+    (100, 30)
+}
+
 fn prompt_password(user: &str) -> Option<String> {
     use std::io::{BufRead, Write};
     if !stdin_is_tty() {
@@ -312,24 +331,36 @@ fn prompt_password(user: &str) -> Option<String> {
     }
     print!("{user} 的密码: ");
     let _ = io::stdout().flush();
-    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    let active = unsafe { libc::tcgetattr(0, &mut saved) } == 0;
-    if active {
-        let mut quiet = saved;
-        quiet.c_lflag &= !libc::ECHO;
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &quiet);
+
+    #[cfg(unix)]
+    {
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        let active = unsafe { libc::tcgetattr(0, &mut saved) } == 0;
+        if active {
+            let mut quiet = saved;
+            quiet.c_lflag &= !libc::ECHO;
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, &quiet);
+            }
         }
-    }
-    let mut line = String::new();
-    let _ = io::stdin().lock().read_line(&mut line);
-    if active {
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &saved);
+        let mut line = String::new();
+        let _ = io::stdin().lock().read_line(&mut line);
+        if active {
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, &saved);
+            }
         }
+        println!();
+        Some(line.trim_end_matches(['\r', '\n']).to_owned()).filter(|text| !text.is_empty())
     }
-    println!();
-    Some(line.trim_end_matches(['\r', '\n']).to_owned()).filter(|text| !text.is_empty())
+
+    #[cfg(not(unix))]
+    {
+        let mut line = String::new();
+        let _ = io::stdin().lock().read_line(&mut line);
+        println!();
+        Some(line.trim_end_matches(['\r', '\n']).to_owned()).filter(|text| !text.is_empty())
+    }
 }
 
 fn stdin_is_tty() -> bool {

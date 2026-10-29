@@ -19,28 +19,123 @@ pub async fn portmap_command(args: &[String]) -> Result<(), String> {
     }
     let local: u16 = positional[0].parse().map_err(|_| "本地端口无效".to_string())?;
     let port: u16 = positional[2].parse().map_err(|_| "目标端口无效".to_string())?;
-    portmap_run(device, local, positional[1], port).await
+    let bind = args.value("--bind").unwrap_or("127.0.0.1").to_owned();
+    portmap_run_bind(device, &bind, local, positional[1], port).await
 }
 
 pub async fn portmap_run(device: &str, local: u16, host: &str, port: u16) -> Result<(), String> {
+    portmap_run_bind(device, "127.0.0.1", local, host, port).await
+}
+
+/// `bind` 可选：`--bind 0.0.0.0`（或任意地址）让局域网其它机器也能连入。
+/// WebRTC 链路断掉后（DataChannel 关闭）自动重连，指数退避 1s→30s 封顶，恢复后继续服务。
+pub async fn portmap_run_bind(device: &str, bind: &str, local: u16, host: &str, port: u16) -> Result<(), String> {
+    use std::net::IpAddr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let bind_addr: IpAddr = bind
+        .parse()
+        .map_err(|_| format!("监听地址无效: {bind}（示例: 127.0.0.1 或 0.0.0.0）"))?;
     let host = host.to_owned();
-    let api = loaded_api()?;
-    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP).await?;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", local))
+    let device = Arc::new(device.to_owned());
+    let api = Arc::new(loaded_api()?);
+
+    // 会话槽：None = 正在重连；重连只在这里发生，accept 循环永远不退出。
+    let session: Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>> = Arc::new(tokio::sync::RwLock::new(None));
+    let backoff = Arc::new(AtomicU64::new(1));
+
+    async fn connect(
+        api: &Arc<Api>,
+        device: &str,
+        session: &Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>>,
+        backoff: &Arc<AtomicU64>,
+    ) {
+        loop {
+            match viewer::join(api, device, viewer::signal::CAPTURE_PORT_MAP).await {
+                Ok(s) => {
+                    *session.write().await = Some(s.peer);
+                    let secs = backoff.load(Ordering::Relaxed);
+                    backoff.store(1, Ordering::Relaxed);
+                    println!("{}", ui::bold("链路已连接"));
+                    if secs > 1 {
+                        println!("  （此前重连等待 {secs}s）");
+                    }
+                    return;
+                }
+                Err(e) => {
+                    let secs = backoff.load(Ordering::Relaxed).min(30);
+                    log::warn!("连接失败（{secs}s 后重试）: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                    backoff.store((secs * 2).max(2).min(30), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    // 后台监控：会话存在但 DataChannel 已关，摘掉它并重连。
+    {
+        let session = session.clone();
+        let api = api.clone();
+        let backoff = backoff.clone();
+        let device = device.clone();
+        tokio::spawn(async move {
+            let mut since_ping = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let peer = session.read().await.clone();
+                let Some(peer) = peer else { continue };
+                // 每 20s 一条探测流：刷新 TURN 租约 / NAT 映射 / SCTP 状态，
+                // 避免空闲链路被中间设备悄悄回收。
+                if since_ping.elapsed() >= std::time::Duration::from_secs(20) {
+                    since_ping = std::time::Instant::now();
+                    peer.keepalive_ping().await;
+                }
+                if peer.wait_channel(viewer::rtc::FILE_CHANNEL, std::time::Duration::from_millis(0)).await.is_err() {
+                    *session.write().await = None;
+                    log::warn!("链路已断开，准备重连");
+                    connect(&api, &device, &session, &backoff).await;
+                }
+            }
+        });
+    }
+
+    let listener = tokio::net::TcpListener::bind((bind_addr, local))
         .await
-        .map_err(|e| format!("监听 127.0.0.1:{local} 失败: {e}"))?;
+        .map_err(|e| format!("监听 {bind}:{local} 失败: {e}"))?;
     println!("{}", ui::bold("隧道就绪"));
-    println!("  127.0.0.1:{local} → {host}:{port}");
-    ui::hint("  Ctrl-C 退出");
+    println!("  {bind}:{local} → {host}:{port}");
+    if bind == "0.0.0.0" || bind == "::" {
+        ui::hint("  注意: 监听所有网卡，本机所在网络的其它设备均可使用此隧道");
+    }
+    ui::hint("  Ctrl-C 退出；链路断开会自动重连");
+    connect(&api, &device, &session, &backoff).await;
     loop {
         let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
-        let peer = session.peer.clone();
+        let session = session.clone();
         let host = host.clone();
         tokio::spawn(async move {
-            match peer.open_flow(&host, port).await {
-                Ok(flow) => pump_socket(socket, flow).await,
-                Err(e) => log::warn!("打开流失败: {e}"),
+            // 短暂自旋等待重连中的会话恢复（最多 ~10s），避免断链瞬间的连接直接失败。
+            for _ in 0..20 {
+                let peer = session.read().await.clone();
+                if let Some(peer) = peer {
+                    match peer.open_flow(&host, port).await {
+                        Ok(flow) => {
+                            pump_socket(socket, flow).await;
+                            return;
+                        }
+                        Err(e) if e.contains("not opened") => {
+                            // 通道已死：等监控线程重连，继续等下一轮。
+                        }
+                        Err(e) => {
+                            log::warn!("打开流失败: {e}");
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
+            log::warn!("连接在等待链路恢复时超时，已断开本地连接");
         });
     }
 }

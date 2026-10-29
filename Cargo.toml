@@ -33,9 +33,3 @@ flate2 = "1"
 libc = "0.2"
 # 终端会话：openpty + Winsize（与主程序同样的特性集）
 nix = { version = "0.29", features = ["term", "process", "fs", "ioctl", "signal"] }
-
-# 与主程序一致：使用仓库内打过补丁的 webrtc（data channel 收包缓冲、SRTP ROC、DTLS）。
-[patch.crates-io]
-webrtc = { path = "../vendor/webrtc" }
-webrtc-dtls = { path = "../vendor/webrtc-dtls" }
-webrtc-srtp = { path = "../vendor/webrtc-srtp" }
