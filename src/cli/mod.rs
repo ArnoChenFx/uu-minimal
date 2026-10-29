@@ -74,7 +74,7 @@ pub async fn dispatch(command: &str, rest: &[String]) -> Result<(), String> {
             Ok(())
         }
         "version" | "-V" | "--version" => {
-            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("UU_MINIMAL_VERSION"));
             Ok(())
         }
         other => {
