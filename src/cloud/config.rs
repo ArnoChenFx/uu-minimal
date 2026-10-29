@@ -30,23 +30,32 @@ pub fn read() -> Result<Option<serde_json::Value>, String> {
 /// 0600 + 临时文件 + rename：中途崩溃不会留下半截凭据。
 pub fn write(cfg: &serde_json::Value) -> Result<PathBuf, String> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = path();
     let dir = path.parent().ok_or("config path has no parent")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    f.write_all(serde_json::to_string_pretty(cfg).unwrap_or_default().as_bytes())
-        .map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| {
+                f.write_all(serde_json::to_string_pretty(cfg).unwrap_or_default().as_bytes())?;
+                f.sync_all()
+            })
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, serde_json::to_string_pretty(cfg).unwrap_or_default())
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+    }
     Ok(path)
 }
 

@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -111,6 +112,7 @@ pub fn is_frame(data: &[u8]) -> bool {
     data.len() >= 4 && &data[..4] == MAGIC
 }
 
+#[cfg(unix)]
 struct Term {
     id: u32,
     shell: String,
@@ -124,6 +126,7 @@ struct Term {
     window: Mutex<(u16, u16)>,
 }
 
+#[cfg(unix)]
 impl Term {
     /// 先拿 link 再拿 journal：OPEN 的回放快照也按这个顺序，保证一段输出只会出现在
     /// 「回放」或「实时」其中一边。
@@ -201,6 +204,7 @@ impl Term {
     }
 }
 
+#[cfg(unix)]
 fn hub() -> &'static Mutex<HashMap<u32, Arc<Term>>> {
     static HUB: OnceLock<Mutex<HashMap<u32, Arc<Term>>>> = OnceLock::new();
     HUB.get_or_init(Default::default)
@@ -213,6 +217,7 @@ fn now_ms() -> u64 {
 }
 
 /// 分配会话号：viewer 给了就用它的，否则取一个没被占用的。
+#[cfg(unix)]
 fn allocate(wanted: u32) -> u32 {
     if wanted != 0 {
         return wanted;
@@ -225,6 +230,12 @@ fn allocate(wanted: u32) -> u32 {
     }
 }
 
+#[cfg(not(unix))]
+fn allocate(wanted: u32) -> u32 {
+    wanted
+}
+
+#[cfg(unix)]
 fn spawn_shell(wanted_id: u32, cols: u16, rows: u16, shell: Option<&str>) -> Result<Arc<Term>, String> {
     use std::os::unix::process::CommandExt;
 
@@ -302,6 +313,7 @@ fn spawn_shell(wanted_id: u32, cols: u16, rows: u16, shell: Option<&str>) -> Res
 }
 
 /// 关掉所有会话（交互式 shell 不响应 SIGTERM，不主动收掉会让 systemd 卡到超时）。
+#[cfg(unix)]
 pub fn shutdown_all() {
     let terms: Vec<Arc<Term>> = hub().lock().unwrap().values().cloned().collect();
     for term in &terms {
@@ -315,6 +327,10 @@ pub fn shutdown_all() {
         log::info!("Terminal sessions closed on shutdown: count={}", terms.len());
     }
 }
+
+
+#[cfg(not(unix))]
+pub fn shutdown_all() {}
 
 fn json_of(payload: &[u8]) -> serde_json::Value {
     serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null)
@@ -333,6 +349,7 @@ fn size_of(payload: &serde_json::Value) -> (u16, u16) {
 }
 
 /// 信号：可以是 `"SIGTERM"`、`"TERM"`、`{"signal":"SIGKILL"}`，认不出就 SIGINT。
+#[cfg(unix)]
 fn signal_of(payload: &[u8]) -> i32 {
     let value = json_of(payload);
     if let Some(number) = value.as_object().and_then(|object| object.values().find_map(|item| item.as_i64())) {
@@ -355,6 +372,12 @@ fn signal_of(payload: &[u8]) -> i32 {
         "ILL" => libc::SIGILL,
         _ => libc::SIGINT,
     }
+}
+
+
+#[cfg(not(unix))]
+fn signal_of(_payload: &[u8]) -> i32 {
+    15
 }
 
 fn reply(code: i64, message: &str) -> Vec<u8> {
@@ -383,44 +406,62 @@ impl TerminalConn {
         if frame.kind != Type::Stdin {
             log::info!("Terminal frame: type={} session={} payload_bytes={}", frame.kind.wire(), frame.session, frame.payload.len());
         }
+        #[cfg(unix)]
         let target = hub().lock().unwrap().get(&frame.session).cloned();
+        #[cfg(not(unix))]
+        let target: Option<std::sync::Arc<()>> = None;
         match frame.kind {
+            #[cfg(unix)]
             Type::Open => self.open(frame.session, &frame.payload, target),
+            #[cfg(not(unix))]
+            Type::Open => self.send(Type::OpenResp, frame.session, &reply(1, "terminal requires unix")),
             Type::Stdin => {
+                #[cfg(unix)]
                 if let Some(term) = target {
                     term.type_in(&frame.payload);
                 }
             }
             Type::Resize => {
+                #[cfg(unix)]
                 if let Some(term) = target {
                     let (cols, rows) = size_of(&json_of(&frame.payload));
                     term.resize(cols, rows);
                 }
             }
             Type::Signal => {
+                #[cfg(unix)]
                 if let Some(term) = target {
                     term.kill(signal_of(&frame.payload));
                 }
             }
             // CLOSE 挂断 shell，DETACH 只是解绑（会话继续活着）。
             Type::Close => {
+                #[cfg(unix)]
                 if let Some(term) = target {
                     *term.link.lock().unwrap() = None;
                     term.kill(libc::SIGHUP);
                 }
             }
             Type::Detach => {
+                #[cfg(unix)]
                 if let Some(term) = target {
                     *term.link.lock().unwrap() = None;
                 }
             }
+            #[cfg(unix)]
             Type::KillReq => self.kill_request(frame.session, &frame.payload),
+            #[cfg(not(unix))]
+            Type::KillReq => self.send(Type::KillResp, frame.session, &reply(1, "terminal requires unix")),
+            #[cfg(unix)]
             Type::ListReq => self.list(frame.session),
+            #[cfg(not(unix))]
+            Type::ListReq => self.send(Type::ListResp, frame.session, b"[]"),
             Type::UnlockReq => self.send(Type::UnlockResp, frame.session, &reply(0, "ok")),
             _ => self.send(Type::Error, frame.session, &reply(1, "unsupported frame")),
         }
     }
 
+    #[cfg(unix)]
     fn open(&self, session: u32, payload: &[u8], existing: Option<Arc<Term>>) {
         let request = json_of(payload);
         let (cols, rows) = size_of(&request);
@@ -430,7 +471,10 @@ impl TerminalConn {
                 term.resize(cols, rows);
                 Ok(term)
             }
+            #[cfg(unix)]
             None => spawn_shell(session, cols, rows, request.get("shell").and_then(|value| value.as_str())),
+            #[cfg(not(unix))]
+            None => Err("terminal sessions require unix (openpty) and are unsupported on this platform".into()),
         };
         let term = match opened {
             Ok(term) => term,
@@ -455,6 +499,7 @@ impl TerminalConn {
         }
     }
 
+#[cfg(unix)]
     fn kill_request(&self, session: u32, payload: &[u8]) {
         let id = if session != 0 {
             session
@@ -473,6 +518,7 @@ impl TerminalConn {
         }
     }
 
+#[cfg(unix)]
     fn list(&self, session: u32) {
         let sessions: Vec<serde_json::Value> = hub()
             .lock()

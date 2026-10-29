@@ -34,8 +34,9 @@ libc = "0.2"
 # 终端会话：openpty + Winsize（与主程序同样的特性集）
 nix = { version = "0.29", features = ["term", "process", "fs", "ioctl", "signal"] }
 
-# 与主程序一致：使用仓库内打过补丁的 webrtc（data channel 收包缓冲、SRTP ROC、DTLS）。
+# 与 uu-remote-linux 相同：vendor 内打过补丁的 webrtc（data channel 收包缓冲、SRTP ROC、DTLS）。
+# vendor-src 为 git submodule，更新：git submodule update --remote vendor-src
 [patch.crates-io]
-webrtc = { path = "../vendor/webrtc" }
-webrtc-dtls = { path = "../vendor/webrtc-dtls" }
-webrtc-srtp = { path = "../vendor/webrtc-srtp" }
+webrtc = { path = "vendor-src/vendor/webrtc" }
+webrtc-dtls = { path = "vendor-src/vendor/webrtc-dtls" }
+webrtc-srtp = { path = "vendor-src/vendor/webrtc-srtp" }

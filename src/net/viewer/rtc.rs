@@ -284,6 +284,35 @@ impl Peer {
         }
         Ok(FlowHandle { peer: self.clone(), rule, stream, rx: data_rx })
     }
+
+    /// 保活探测流：走 FILE 通道开一条真实流（SYN → SYN_ACK → FIN），让
+    /// TURN 中继租约与 NAT 映射一直有流量。云端的 Message 27 语义下这
+    /// 与普通连接无异；host 连一个不存在端口会回 SYN_ACK error，同样
+    /// 能证明链路活着——只要 SYN 发出去且有回包，SCTP/DTLS/ICE 全链路
+    /// 都被刷新。探测失败只记日志，链路死亡由 portmap 的监控线程处理。
+    pub async fn keepalive_ping(&self) {
+        let rule = self.next_rule.fetch_add(1, Ordering::Relaxed);
+        let stream = 1u64;
+        let (data, _data_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (ack, ack_rx) = oneshot::channel();
+        let flow = Arc::new(Flow { data, ack: Mutex::new(Some(ack)) });
+        self.flows.lock().unwrap().insert((rule, stream), flow);
+
+        let syn = json!({"version": 1, "target_host": "127.0.0.1", "target_port": 1}).to_string();
+        if let Err(e) = self.send_file(frame(rule, stream, SYN, syn.as_bytes())).await {
+            log::debug!("keepalive 发送失败（链路可能已断）: {e}");
+            self.flows.lock().unwrap().remove(&(rule, stream));
+            return;
+        }
+        match tokio::time::timeout(CONNECT_TIMEOUT, ack_rx).await {
+            Ok(Ok(_)) => log::debug!("keepalive ok: rule={rule}"),
+            _ => log::debug!("keepalive 无回包（链路可能已断）: rule={rule}"),
+        }
+        // 无论结果如何都清掉这条流；host 侧若真连上了 127.0.0.1:1 也会因
+        // 收到我们的 FIN 立即释放。
+        self.flows.lock().unwrap().remove(&(rule, stream));
+        let _ = self.send_file(frame(rule, stream, FIN, &[])).await;
+    }
 }
 
 pub struct FlowHandle {

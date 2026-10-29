@@ -175,18 +175,24 @@ fn setting_or(cfg: &Value, key: &str, default: &str) -> String {
 /// 且 `memory` 必须是字符串（缺一个服务端就 422 1001）。这些值都可用 config.json 同名项覆盖。
 fn init_body(platform: crate::cloud::config::Platform, cfg: &Value, creds: &Credentials) -> Value {
     let ram = memory_mb();
+    // mac/base_board/cpu/video 探测函数只覆盖 Unix；Windows 上读不到会返回空/默认值，
+    // 两台机器上报完全相同导致服务端识别为同一设备。全部允许 config.json 同名键覆盖，
+    // 缺省才走探测。
     let mut body = json!({
         "name": setting(cfg, "host_name"),
         "client_id": &creds.client_id,
         "system_id": &creds.system_id,
         "machine_guid": setting(cfg, "machine_guid"),
-        "os": os_name(),
-        "base_board": base_board(),
-        "cpu": cpu_name(),
-        "video": video(),
-        "mac": mac(),
+        "os": setting_or(cfg, "os", &os_name()),
+        "base_board": setting_or(cfg, "base_board", &base_board()),
+        "cpu": setting_or(cfg, "cpu", &cpu_name()),
+        "video": setting(cfg, "video")
+            .is_empty()
+            .then(|| video())
+            .unwrap_or_else(|| vec![setting(cfg, "video")]),
+        "mac": setting_or(cfg, "mac", &mac()),
         "memory": ram,
-        "screen": "1920x1080",
+        "screen": setting_or(cfg, "screen", "1920x1080"),
     });
     if platform == crate::cloud::config::Platform::Mac {
         body["memory"] = json!(ram.to_string());
@@ -319,6 +325,7 @@ fn video() -> Vec<String> {
 }
 
 /// 第一块物理网卡的 MAC，大写短横线形式（与 Windows 一致）。
+#[cfg(unix)]
 fn mac() -> String {
     let mut names: Vec<String> = std::fs::read_dir("/sys/class/net")
         .map(|d| {
@@ -335,6 +342,35 @@ fn mac() -> String {
         .find(|m| !m.is_empty() && m != "00:00:00:00:00:00")
         .map(|m| m.to_uppercase().replace(':', "-"))
         .unwrap_or_default()
+}
+
+/// Windows：GetAdaptersInfo 系列不可无依赖直调，用系统自带的 getmac 解析。
+/// 输出行形如 `AA-BB-CC-DD-EE-FF   \Device\Tcpip_{...}`；跳过虚拟/回环
+/// 常见前缀（媒体断开的适配器 getmac 本来就不列）。取第一个物理网卡。
+#[cfg(windows)]
+fn mac() -> String {
+    let Ok(output) = std::process::Command::new("getmac").arg("/fo").arg("csv").arg("/nh").output() else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        // CSV: "AA-BB-CC-DD-EE-FF","\Device\Tcpip_{...}"
+        let first = line.split(',').next().unwrap_or("").trim_matches('"');
+        let normalized = first.trim();
+        let hex = normalized.chars().filter(|c| c.is_ascii_hexdigit()).count();
+        if normalized.len() == 17 && hex == 12 && normalized != "00-00-00-00-00-00" {
+            let disabled = normalized.starts_with("02-") || normalized.starts_with("0A-");
+            if !disabled {
+                return normalized.to_uppercase();
+            }
+        }
+    }
+    String::new()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn mac() -> String {
+    String::new()
 }
 
 #[cfg(test)]

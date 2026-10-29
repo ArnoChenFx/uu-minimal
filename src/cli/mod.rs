@@ -30,8 +30,9 @@ uu-minimal — UU 远程的最小可用骨架（登录 · 组网 · 终端 · �
                                  系统 sftp，ProxyCommand 指回本程序
   tunnel --device <id> <主机> <端口>
                                  stdio 桥，给系统 ssh 的 ProxyCommand 用
-  portmap --device <id> <本地端口> <目标主机> <目标端口>
-                                 本地端口 → 目标设备可达的地址
+  portmap --device <id> [--bind 地址] <本地端口> <目标主机> <目标端口>
+                                 本地端口 → 目标设备可达的地址；默认只监听 127.0.0.1，
+                                 --bind 0.0.0.0 可让同网段其它机器连入；WebRTC 断线自动重连
 
 本机被控（仅桌面 Linux）:
   run                            host 端：建房、回 answer、服务终端与端口映射
