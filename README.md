@@ -33,6 +33,8 @@ cargo build --release
 
 `run` 收到房间级离开通知后会重新建房；短暂 ICE `Disconnected` 保留端口映射 TCP 流，明确 `Failed` / `Closed` 才清理。控制端 `portmap` 在通道关闭、PeerConnection 失败，或连续三次探测无回包后重连；被控端恢复后无需手动重启 `portmap`。重连会建立新链路，已经断开的业务 TCP 连接仍需业务客户端重新建立。
 
+被控端 `run` 还会通过信令事件 `refresh_reconnect_key` 刷新当前房间的重连凭证：Socket.IO 握手完成后约 30 秒首次发送，有效成功应答后约每 5 分钟刷新，失败或无应答约 30 秒重试，避免遗漏此步骤造成约 20 分钟后的房间回收。日志会记录刷新请求和成功/无效应答，凭证仅保存在当前房间内存中；普通心跳及端口映射探测不能替代这一步。此机制参照 [uu-remote-linux v0.1.5 的修复说明](https://github.com/VallierDev/uu-remote-linux/releases/tag/v0.1.5)。
+
 程序默认不写日志文件。Windows 使用 NSSM 时，可在管理员 CMD 中设置日志输出（替换服务名和目录，先创建日志目录）：
 
 ```bat

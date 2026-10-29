@@ -15,6 +15,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::net::ice::SessionIce;
 
+mod refresh;
+
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PING_WINDOW: Duration = Duration::from_secs(45);
 
@@ -87,6 +89,10 @@ impl Signaling {
     }
 
     pub async fn connect(url: &str, room_token: &str, events: mpsc::Sender<Event>) -> Result<Arc<Self>, String> {
+        Self::connect_with_timing(url, room_token, events, refresh::Timing::default()).await
+    }
+
+    async fn connect_with_timing(url: &str, room_token: &str, events: mpsc::Sender<Event>, timing: refresh::Timing) -> Result<Arc<Self>, String> {
         let ws_url = format!("{}/socket.io/?transport=websocket&EIO=4", url.trim_end_matches('/'));
         let mut request = ws_url.into_client_request().map_err(|_| "信令 URL 无效")?;
         request
@@ -111,6 +117,7 @@ impl Signaling {
         let sender = tx.clone();
         let reader = tokio::spawn(async move {
             let mut counter = 10u64;
+            let mut refresh = refresh::Refresh::new(timing);
             // 45/46 的文本头先到，二进制附件随后单独一帧。
             let mut pending: Option<(String, Value)> = None;
             let mut window = DEFAULT_PING_WINDOW;
@@ -122,6 +129,17 @@ impl Signaling {
                         log::warn!("信令心跳超时（未收到 ping）");
                         let _ = events.send(Event::Closed).await;
                         break;
+                    }
+                    _ = tokio::time::sleep_until(refresh.next.unwrap_or(deadline)), if refresh.next.is_some() => {
+                        counter += 1;
+                        // Socket.IO 有 ACK 编号，但事件没有额外参数。
+                        if sender.try_send(format!("42{counter}[\"refresh_reconnect_key\"]")).is_err() {
+                            log::warn!("重连凭证刷新请求无法入队，重建房间");
+                            break;
+                        }
+                        refresh.sent(counter, tokio::time::Instant::now());
+                        log::info!("已请求刷新房间重连凭证");
+                        continue;
                     }
                     message = read.next() => message,
                 };
@@ -148,6 +166,7 @@ impl Signaling {
                                 break;
                             }
                         } else if text.starts_with("40") {
+                            refresh.connected(tokio::time::Instant::now());
                             counter += 1;
                             let _ = sender.try_send(format!("42{counter}[\"room_info\"]"));
                             log::info!("Socket.IO 已连接，等待遥控端");
@@ -156,7 +175,14 @@ impl Signaling {
                             }
                         } else if text.starts_with("43") {
                             let begin = text.find('[').unwrap_or(2);
-                            log::debug!("收到 ack id={}", text[2..begin].parse::<u64>().unwrap_or(0));
+                            if let Ok(id) = text[2..begin].parse::<u64>() {
+                                // 非法 JSON 也不能误判为成功；保留请求时安排的重试。
+                                let payload = serde_json::from_str::<Value>(&text[begin..]).unwrap_or(Value::Null);
+                                if let Some(success) = refresh.acknowledge(id, &payload, tokio::time::Instant::now()) {
+                                    if success { log::info!("房间重连凭证刷新成功"); }
+                                    else { log::warn!("房间重连凭证刷新应答无效，将按计划重试"); }
+                                } else { log::debug!("收到非刷新或已过期的 ack id={id}"); }
+                            }
                         } else if text.starts_with("45") || text.starts_with("46") {
                             let body = text.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
                             let parsed = serde_json::from_str::<Value>(body).ok();
@@ -301,6 +327,58 @@ fn read_varint(bytes: &[u8], mut i: usize) -> Option<(u64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refresh_request(message: Message) -> u64 {
+        let text = message.into_text().unwrap();
+        let rest = text.strip_prefix("42").unwrap();
+        let begin = rest.find('[').unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&rest[begin..]).unwrap(), serde_json::json!(["refresh_reconnect_key"]));
+        rest[..begin].parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn refresh_protocol_handles_success_failure_silence_and_heartbeats() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let timing = refresh::Timing { first: Duration::from_millis(50), retry: Duration::from_millis(60), success: Duration::from_millis(180) };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // WebSocket 建立、Engine.IO open 均不能提前启动 Socket.IO 的刷新。
+            assert!(tokio::time::timeout(Duration::from_millis(80), socket.next()).await.is_err());
+            socket.send(Message::Text("0{\"pingInterval\":5000,\"pingTimeout\":5000}".into())).await.unwrap();
+            assert_eq!(socket.next().await.unwrap().unwrap().into_text().unwrap(), "40");
+            assert!(tokio::time::timeout(Duration::from_millis(80), socket.next()).await.is_err());
+            socket.send(Message::Text("40{}".into())).await.unwrap();
+            let info = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            assert_eq!(info, "4211[\"room_info\"]");
+
+            let first = refresh_request(socket.next().await.unwrap().unwrap());
+            assert_eq!(first, 12); // 与 room_info 共用递增 ACK 编号，不能冲突。
+            socket.send(Message::Text("2".into())).await.unwrap();
+            assert_eq!(socket.next().await.unwrap().unwrap().into_text().unwrap(), "3");
+            let accepted = tokio::time::Instant::now();
+            socket.send(Message::Text(format!("43{first}[\"success\",{{\"reconnect_key\":\"test-only\"}}]"))).await.unwrap();
+            let second = refresh_request(socket.next().await.unwrap().unwrap());
+            assert!(accepted.elapsed() >= timing.success - Duration::from_millis(5));
+            assert!(second > first);
+            socket.send(Message::Text(format!("43{second}[\"success\",{{\"reconnect_key\":123}}]"))).await.unwrap();
+            let third = refresh_request(socket.next().await.unwrap().unwrap());
+            assert!(third > second);
+            // 无 ACK 仍须重试，且不能妨碍收取房间退出事件。
+            let fourth = refresh_request(socket.next().await.unwrap().unwrap());
+            assert!(fourth > third);
+            socket.send(Message::Text("42[\"leave\",{}]".into())).await.unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let signal = Signaling::connect_with_timing(&format!("ws://{address}"), "test", tx, timing).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            assert!(matches!(rx.recv().await, Some(Event::Connected)));
+            assert!(matches!(rx.recv().await, Some(Event::Closed)));
+            server.await.unwrap();
+        }).await.unwrap();
+        drop(signal);
+    }
 
     #[test]
     fn room_leave_without_peer_id_requires_reconnection() {
