@@ -59,8 +59,12 @@ uu-minimal list                 # TTY 进菜单；管道只打印
 uu-minimal portmap --device <id> 2222 127.0.0.1 22
 ssh -p 2222 me@127.0.0.1
 
-# 监听所有网卡，供局域网其它设备使用（默认 --bind 127.0.0.1）
-uu-minimal portmap --device <id> --bind 0.0.0.0 2222 127.0.0.1 22
+# 同一 device 开多个本地端口：一个进程 + 多个 --map（不要开两个 portmap 进程，会 force_join 互踢）
+uu-minimal portmap --device <id> \
+  --map 2222,127.0.0.1,22 --map 3389,192.168.0.10,3389
+
+# 监听所有网卡（默认 --bind 127.0.0.1）
+uu-minimal portmap --device <id> --bind 0.0.0.0 --map 2222,127.0.0.1,22
 
 uu-minimal ssh --device <id> --user me
 uu-minimal ssh --device <id> --user me --command "uname -a"
@@ -74,7 +78,7 @@ uu-minimal sftp --device <id> me@127.0.0.1   # exec 系统 sftp，ProxyCommand �
 
 内嵌 SSH（russh）不读 `~/.ssh/config`，也不调用系统 ssh。认证顺序：`--password` → `--key` 或 `~/.ssh/id_{ed25519,ecdsa,rsa}` → 终端输入。主机密钥存在 `~/.config/uuremote/known_hosts`（TOFU，`<host>:<port> <sha256>`），指纹变了就拒绝，不碰 `~/.ssh/known_hosts`。
 
-`list` 顶部「本机」来自 `current_device`（名字字段是 `alias`），不在自有/共享列表里，也不进选择菜单；`controllable` 为假表示官方客户端连不进来。菜单项是 ssh、sftp、portmap（占到 Ctrl-C）。ssh / portmap 在本进程 `force_join` 同一设备，**不要同时开两条**（后开的会顶掉先开的）；ssh 退出后菜单会重新 join。
+`list` 顶部「本机」来自 `current_device`（名字字段是 `alias`），不在自有/共享列表里，也不进选择菜单；`controllable` 为假表示官方客户端连不进来。菜单项是 ssh、sftp、portmap（占到 Ctrl-C）。ssh 与 portmap 各占一条 WebRTC，**不要同时开**；同一 device **不要开两个 portmap 进程**，多端口用 **`--map` 重复**（见上）。ssh 退出后菜单会重新 join。
 
 `join` 带 `force_join: true`；`ice_id` 以云端 ack 为准；offer 补 `a=x-uuremote-quic`。官方 host 可能用二进制事件加 gzip_sdp 回 answer。一条 Message 27 流就是一条 TCP。
 

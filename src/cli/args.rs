@@ -17,12 +17,24 @@ impl<'a> Args<'a> {
     }
 
     pub fn value(&self, name: &str) -> Option<&'a str> {
-        self.items
-            .iter()
-            .position(|item| item == name)
-            .and_then(|index| self.items.get(index + 1))
-            .filter(|value| !value.starts_with("--"))
-            .map(String::as_str)
+        self.values(name).into_iter().next()
+    }
+
+    /// 同一开关多次出现时的全部取值（例如多个 `--map`）。
+    pub fn values(&self, name: &str) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < self.items.len() {
+            if self.items[index] == name {
+                if let Some(value) = self.items.get(index + 1).filter(|v| !v.starts_with("--")) {
+                    out.push(value.as_str());
+                    index += 2;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        out
     }
 
     pub fn require_device(&self) -> Result<&'a str, String> {
