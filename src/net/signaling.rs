@@ -65,9 +65,11 @@ impl Drop for Signaling {
     }
 }
 
-/// 没有 peer 标识的离开通知属于房间级事件，必须重新申请房间。
+/// 无法识别 peer 的离开通知按房间退出处理，重新申请房间。
 fn release_event(name: &str, data: &Value) -> Event {
-    let id = ["ice_id", "iceId"].iter().filter_map(|key| data.get(*key)).find_map(|value| match value {
+    let nested = data.get("data").unwrap_or(&Value::Null);
+    let id = [data, nested].into_iter().flat_map(|body| ["ice_id", "iceId"].into_iter()
+        .filter_map(move |key| body.get(key))).find_map(|value| match value {
         Value::String(id) if !id.is_empty() => Some(id.clone()),
         Value::Number(id) => Some(id.to_string()),
         _ => None,
@@ -309,6 +311,27 @@ mod tests {
         }
         for data in [serde_json::json!({"ice_id":"42"}), serde_json::json!({"iceId":42})] {
             assert!(matches!(release_event("left", &data), Event::Released(id) if id == "42"));
+        }
+    }
+
+    #[test]
+    fn nested_peer_ids_do_not_trigger_room_reconnection() {
+        for name in ["released", "left", "leave"] {
+            for data in [
+                serde_json::json!({"data":{"ice_id":"nested"}}),
+                serde_json::json!({"data":{"iceId":"nested"}}),
+                serde_json::json!({"ice_id":"", "data":{"ice_id":"nested"}}),
+                serde_json::json!({"ice_id":null, "data":{"iceId":"nested"}}),
+            ] {
+                assert!(matches!(release_event(name, &data), Event::Released(id) if id == "nested"));
+            }
+            assert!(matches!(release_event(name, &serde_json::json!({"data":{"iceId":42}})),
+                Event::Released(id) if id == "42"));
+            assert!(matches!(release_event(name, &serde_json::json!({"ice_id":"top", "data":{"ice_id":"nested"}})),
+                Event::Released(id) if id == "top"));
+            for data in [serde_json::json!({"data":{}}), serde_json::json!({"data":{"ice_id":""}})] {
+                assert!(matches!(release_event(name, &data), Event::Closed));
+            }
         }
     }
 
