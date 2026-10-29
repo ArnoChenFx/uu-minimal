@@ -23,14 +23,16 @@ pub async fn run() -> Result<(), String> {
     let api = Arc::new(Api::new(creds));
 
     let mut stopping = false;
+    let mut reconnect = crate::net::retry::Backoff::immediate();
     loop {
         log::info!("向云端申请房间凭据…");
         let room = match api.create_room().await {
             Ok(room) => room,
             Err(RoomError::LoginExpired) => return Err("登录已失效，请重新执行 `uu-minimal login`".into()),
             Err(RoomError::Other(e)) => {
-                log::error!("建房失败: {e}，5s 后重试");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let delay = reconnect.delay();
+                log::error!("建房失败: {e}，{}ms 后重试", delay.as_millis());
+                if !wait_retry(delay).await { break; }
                 continue;
             }
         };
@@ -41,12 +43,14 @@ pub async fn run() -> Result<(), String> {
         let signaling = match Signaling::connect(&server, &room.token, tx).await {
             Ok(signaling) => signaling,
             Err(e) => {
-                log::error!("信令连接失败: {e}，5s 后重试");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let delay = reconnect.delay();
+                log::error!("信令连接失败: {e}，{}ms 后重试", delay.as_millis());
+                if !wait_retry(delay).await { break; }
                 continue;
             }
         };
 
+        let room_started = std::time::Instant::now();
         // 一个 ice_id = 一个 peer（桌面 / 文件 / 终端 / 端口映射各一条）。
         let mut pending_ice: HashMap<String, ice::SessionIce> = HashMap::new();
         let mut fallback_ice: Option<ice::SessionIce> = None;
@@ -108,13 +112,18 @@ pub async fn run() -> Result<(), String> {
             }
         }
 
+        let room_lifetime = room_started.elapsed();
         signaling.shutdown();
-        for (_, pc) in peers.drain() {
+        futures_util::future::join_all(peers.drain().map(|(_, pc)| async move {
             close_peer(&pc).await;
-        }
+        })).await;
         drop(signaling);
         if stopping { break; }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        let delay = reconnect.after_session(room_lifetime);
+        if !delay.is_zero() {
+            log::warn!("房间反复中断，{}ms 后重新建房", delay.as_millis());
+            if !wait_retry(delay).await { break; }
+        }
     }
 
     // Ctrl-C：交互式 shell 不响应 SIGTERM，这里显式收掉所有终端会话。
@@ -124,6 +133,13 @@ pub async fn run() -> Result<(), String> {
 
 fn value_text(value: &Value) -> String {
     value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())
+}
+
+async fn wait_retry(delay: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        _ = tokio::signal::ctrl_c() => false,
+    }
 }
 
 async fn close_peer(pc: &webrtc::peer_connection::RTCPeerConnection) {

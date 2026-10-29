@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
@@ -89,12 +89,19 @@ pub struct Peer {
     flows: Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>,
     next_rule: AtomicU64,
     signal: Arc<Signal>,
+    transport_changed: Arc<Notify>,
 }
 
 impl Peer {
     pub async fn new(config: RTCConfiguration, app_id: String, ice_id: String, remote: String, signal: Arc<Signal>) -> Result<Self, String> {
         let api = APIBuilder::new().with_media_engine(MediaEngine::default()).build();
         let pc = Arc::new(api.new_peer_connection(config).await.map_err(|e| format!("创建 PeerConnection 失败: {e}"))?);
+        let transport_changed = Arc::new(Notify::new());
+        let changed = transport_changed.clone();
+        pc.on_peer_connection_state_change(Box::new(move |_| {
+            let changed = changed.clone();
+            Box::pin(async move { changed.notify_one(); })
+        }));
 
         let (app, ice, client) = (app_id.clone(), ice_id.clone(), remote.clone());
         let weak = Arc::downgrade(&pc);
@@ -153,6 +160,11 @@ impl Peer {
                 let flows = flows.clone();
                 Box::pin(async move { dispatch_flow(&flows, &message.data).await })
             }));
+            let changed = transport_changed.clone();
+            channels[FILE_CHANNEL].on_close(Box::new(move || {
+                let changed = changed.clone();
+                Box::pin(async move { changed.notify_one(); })
+            }));
         }
 
         Ok(Self {
@@ -166,6 +178,7 @@ impl Peer {
             flows,
             next_rule: AtomicU64::new(1),
             signal,
+            transport_changed,
         })
     }
 
@@ -326,6 +339,23 @@ impl Peer {
         matches!(self.pc.connection_state(), RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed)
             || self.channels[FILE_CHANNEL].ready_state() != RTCDataChannelState::Open
     }
+
+    pub async fn wait_transport_closed(&self) {
+        loop {
+            let changed = self.transport_changed.notified();
+            if self.transport_closed() { return; }
+            changed.await;
+        }
+    }
+
+    /// 硬断线时中断正在等待回包的探测；调用方随后 close 清理其待处理流。
+    pub async fn probe_or_closed(&self) -> Option<bool> {
+        tokio::select! {
+            biased;
+            _ = self.wait_transport_closed() => None,
+            alive = self.keepalive_ping() => Some(alive),
+        }
+    }
 }
 
 pub struct FlowHandle {
@@ -479,6 +509,57 @@ fn answer_sdp(body: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn file_close_interrupts_an_inflight_probe_on_a_live_peer_connection() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text("0{}".into())).await.unwrap();
+            assert_eq!(socket.next().await.unwrap().unwrap().into_text().unwrap(), "40");
+            socket.send(Message::Text("40{}".into())).await.unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let (events, _rx) = mpsc::channel(8);
+        let signal = Signal::connect(&format!("ws://{address}"), "test", Duration::from_secs(2), events).await.unwrap();
+        let peer = Peer::new(RTCConfiguration::default(), "app".into(), "ice".into(), "remote".into(), signal).await.unwrap();
+        let remote = APIBuilder::new().build().new_peer_connection(RTCConfiguration::default()).await.unwrap();
+        let (file_tx, file_rx) = oneshot::channel();
+        let file_tx = Arc::new(Mutex::new(Some(file_tx)));
+        remote.on_data_channel(Box::new(move |channel| {
+            if channel.label() == CHANNELS[FILE_CHANNEL] {
+                if let Some(tx) = file_tx.lock().unwrap().take() { let _ = tx.send(channel); }
+            }
+            Box::pin(async {})
+        }));
+        let offer = peer.pc.create_offer(None).await.unwrap();
+        let mut gathered = peer.pc.gathering_complete_promise().await;
+        peer.pc.set_local_description(offer).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gathered.recv()).await.unwrap();
+        remote.set_remote_description(peer.pc.local_description().await.unwrap()).await.unwrap();
+        let answer = remote.create_answer(None).await.unwrap();
+        let mut gathered = remote.gathering_complete_promise().await;
+        remote.set_local_description(answer).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gathered.recv()).await.unwrap();
+        peer.pc.set_remote_description(remote.local_description().await.unwrap()).await.unwrap();
+        peer.wait_channel(FILE_CHANNEL, Duration::from_secs(10)).await.unwrap();
+        let remote_file = tokio::time::timeout(Duration::from_secs(2), file_rx).await.unwrap().unwrap();
+
+        // 远端 FILE 通道不回复 SYN，探测本应等到 CONNECT_TIMEOUT。
+        let probe = peer.probe_or_closed();
+        tokio::pin!(probe);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut probe).await.is_err());
+        remote_file.close().await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), &mut probe).await.unwrap(), None);
+        assert_eq!(peer.pc.connection_state(), webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected);
+        peer.close().await;
+        remote.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+    }
 
     #[tokio::test]
     async fn closing_stale_peer_releases_waiters_and_signaling() {
