@@ -146,12 +146,7 @@ pub async fn answer(
             log::info!("PeerConnection 状态: {state:?}");
             let mapping = mapping.clone();
             Box::pin(async move {
-                if matches!(
-                    state,
-                    RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed | RTCPeerConnectionState::Disconnected
-                ) {
-                    mapping.shutdown();
-                }
+                mapping.on_peer_state(state);
             })
         }));
     }

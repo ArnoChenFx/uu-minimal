@@ -342,6 +342,14 @@ impl Session {
     }
 
     /// peer connection 结束：所有目标连接一起关。
+    pub fn on_peer_state(&self, state: webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState) {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        // Disconnected 仍可由 ICE 自动恢复；保留 TCP 流直到明确失败或关闭。
+        if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
+            self.shutdown();
+        }
+    }
+
     pub fn shutdown(&self) {
         let pipes: Vec<Pipe> = self.pipes.lock().unwrap().drain().map(|(_, pipe)| pipe).collect();
         if !pipes.is_empty() {
@@ -371,6 +379,26 @@ async fn open_channel(slot: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>) -> Option<
 mod tests {
     use super::*;
     use crate::proto::Field;
+
+    #[tokio::test]
+    async fn transient_disconnect_preserves_pipes_but_failure_closes_them() {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as State;
+        for terminal in [State::Failed, State::Closed] {
+            let session = Session::new(Arc::new(Mutex::new(None)), Arc::new(AtomicU64::new(0)));
+            let key = Key { session: Ident::Int(1), rule: Ident::Int(2), stream: Ident::Int(3) };
+            let (writes, mut rx) = mpsc::channel(1);
+            let reader = tokio::spawn(std::future::pending::<()>());
+            session.pipes.lock().unwrap().insert(key.clone(), Pipe { writes, reader: reader.abort_handle() });
+            session.on_peer_state(State::Disconnected);
+            session.on_peer_state(State::Connected);
+            session.forward(key, b"after recovery");
+            assert_eq!(rx.recv().await.unwrap(), b"after recovery");
+            assert!(!reader.is_finished());
+            session.on_peer_state(terminal);
+            assert!(rx.recv().await.is_none());
+            assert!(reader.await.unwrap_err().is_cancelled());
+        }
+    }
 
     #[test]
     fn syn_payload_accepts_both_key_styles() {

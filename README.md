@@ -31,6 +31,21 @@ cargo build --release
 
 日志默认本程序 `info`，`webrtc*` / `russh` 压到 `warn`。`ssh` / `sftp` / `tunnel` 默认静音（独占终端）。`RUST_LOG` 优先，例如 `RUST_LOG=info,webrtc_ice=debug`；`NO_COLOR=1` 关颜色。
 
+`run` 收到房间级离开通知后会重新建房；短暂 ICE `Disconnected` 保留端口映射 TCP 流，明确 `Failed` / `Closed` 才清理。控制端 `portmap` 在通道关闭、PeerConnection 失败，或连续三次探测无回包后重连；被控端恢复后无需手动重启 `portmap`。重连会建立新链路，已经断开的业务 TCP 连接仍需业务客户端重新建立。
+
+程序默认不写日志文件。Windows 使用 NSSM 时，可在管理员 CMD 中设置日志输出（替换服务名和目录，先创建日志目录）：
+
+```bat
+nssm set "服务名" AppStdout "C:\uu-minimal\logs\stdout.log"
+nssm set "服务名" AppStderr "C:\uu-minimal\logs\stderr.log"
+nssm set "服务名" AppRotateFiles 1
+nssm set "服务名" AppRotateOnline 1
+nssm set "服务名" AppRotateBytes 10485760
+nssm restart "服务名"
+```
+
+连接恢复日志主要在 `stderr.log`。NSSM 的进程重启策略无法检测进程内部的链路假死；排查时保留掉线前后的日志。
+
 凭据与主程序共用。`UU_CONFIG` 指向别处的 `config.json`（相对路径按当前目录解析）：
 
 ```sh

@@ -88,6 +88,7 @@ pub struct Peer {
     early: Mutex<Vec<RTCIceCandidateInit>>,
     flows: Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>,
     next_rule: AtomicU64,
+    signal: Arc<Signal>,
 }
 
 impl Peer {
@@ -97,8 +98,9 @@ impl Peer {
 
         let (app, ice, client) = (app_id.clone(), ice_id.clone(), remote.clone());
         let weak = Arc::downgrade(&pc);
+        let signal_for_candidates = signal.clone();
         pc.on_ice_candidate(Box::new(move |candidate: Option<webrtc::ice_transport::ice_candidate::RTCIceCandidate>| {
-            let (weak, signal, app, ice, client) = (weak.clone(), signal.clone(), app.clone(), ice.clone(), client.clone());
+            let (weak, signal, app, ice, client) = (weak.clone(), signal_for_candidates.clone(), app.clone(), ice.clone(), client.clone());
             Box::pin(async move {
                 let Some(candidate) = candidate else { return };
                 let Ok(mut value) = candidate.to_json() else { return };
@@ -127,7 +129,7 @@ impl Peer {
                     let flows = flows.clone();
                     channel.on_message(Box::new(move |message: DataChannelMessage| {
                         let flows = flows.clone();
-                        Box::pin(async move { dispatch_flow(&flows, &message.data) })
+                        Box::pin(async move { dispatch_flow(&flows, &message.data).await })
                     }));
                 }
                 Box::pin(async {})
@@ -149,7 +151,7 @@ impl Peer {
             let flows = flows.clone();
             channels[FILE_CHANNEL].on_message(Box::new(move |message: DataChannelMessage| {
                 let flows = flows.clone();
-                Box::pin(async move { dispatch_flow(&flows, &message.data) })
+                Box::pin(async move { dispatch_flow(&flows, &message.data).await })
             }));
         }
 
@@ -163,6 +165,7 @@ impl Peer {
             early: Mutex::new(Vec::new()),
             flows,
             next_rule: AtomicU64::new(1),
+            signal,
         })
     }
 
@@ -252,9 +255,8 @@ impl Peer {
     }
 
     async fn send_file(&self, message: Vec<u8>) -> Result<(), String> {
-        self.channels[FILE_CHANNEL]
-            .send(&Bytes::from(message))
-            .await
+        tokio::time::timeout(CONNECT_TIMEOUT, self.channels[FILE_CHANNEL].send(&Bytes::from(message)))
+            .await.map_err(|_| "FILE 通道发送超时".to_string())?
             .map(|_| ())
             .map_err(|e| format!("FILE 通道发送失败: {e}"))
     }
@@ -289,8 +291,8 @@ impl Peer {
     /// TURN 中继租约与 NAT 映射一直有流量。云端的 Message 27 语义下这
     /// 与普通连接无异；host 连一个不存在端口会回 SYN_ACK error，同样
     /// 能证明链路活着——只要 SYN 发出去且有回包，SCTP/DTLS/ICE 全链路
-    /// 都被刷新。探测失败只记日志，链路死亡由 portmap 的监控线程处理。
-    pub async fn keepalive_ping(&self) {
+    /// 都有流量。返回是否收到回包（目标端口拒绝也算链路正常）。
+    pub async fn keepalive_ping(&self) -> bool {
         let rule = self.next_rule.fetch_add(1, Ordering::Relaxed);
         let stream = 1u64;
         let (data, _data_rx) = mpsc::channel::<Vec<u8>>(16);
@@ -302,16 +304,27 @@ impl Peer {
         if let Err(e) = self.send_file(frame(rule, stream, SYN, syn.as_bytes())).await {
             log::debug!("keepalive 发送失败（链路可能已断）: {e}");
             self.flows.lock().unwrap().remove(&(rule, stream));
-            return;
+            return false;
         }
-        match tokio::time::timeout(CONNECT_TIMEOUT, ack_rx).await {
-            Ok(Ok(_)) => log::debug!("keepalive ok: rule={rule}"),
-            _ => log::debug!("keepalive 无回包（链路可能已断）: rule={rule}"),
-        }
+        let alive = matches!(tokio::time::timeout(CONNECT_TIMEOUT, ack_rx).await, Ok(Ok(_)));
+        log::debug!("keepalive: reply_received={alive}");
         // 无论结果如何都清掉这条流；host 侧若真连上了 127.0.0.1:1 也会因
         // 收到我们的 FIN 立即释放。
         self.flows.lock().unwrap().remove(&(rule, stream));
         let _ = self.send_file(frame(rule, stream, FIN, &[])).await;
+        alive
+    }
+
+    pub async fn close(&self) {
+        self.signal.shutdown();
+        self.flows.lock().unwrap().clear();
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT, self.pc.close()).await;
+    }
+
+    pub fn transport_closed(&self) -> bool {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        matches!(self.pc.connection_state(), RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed)
+            || self.channels[FILE_CHANNEL].ready_state() != RTCDataChannelState::Open
     }
 }
 
@@ -362,7 +375,7 @@ impl FlowReader {
     }
 }
 
-fn dispatch_flow(flows: &Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>, data: &[u8]) {
+async fn dispatch_flow(flows: &Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>, data: &[u8]) {
     let Ok(fields) = read_fields(data) else { return };
     let Some(WireValue::Bytes(raw)) = fields.iter().find(|f| f.number == MESSAGE_FIELD).map(|f| &f.value) else { return };
     let Ok(frame) = read_fields(raw) else { return };
@@ -381,7 +394,8 @@ fn dispatch_flow(flows: &Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>, data: &[u8]
     };
     match kind {
         DATA => {
-            let _ = flow.data.try_send(payload);
+            // TCP 隧道必须逐字节可靠：接收慢时施加背压，不能静默丢帧。
+            let _ = flow.data.send(payload).await;
         }
         FIN => {
             flows.lock().unwrap().remove(&(rule, stream));
@@ -465,6 +479,54 @@ fn answer_sdp(body: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closing_stale_peer_releases_waiters_and_signaling() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text("0{}".into())).await.unwrap();
+            assert_eq!(socket.next().await.unwrap().unwrap().into_text().unwrap(), "40");
+            socket.send(Message::Text("40{}".into())).await.unwrap();
+            // 保持信令连接，直到控制端显式释放旧会话。
+            let ended = tokio::time::timeout(Duration::from_secs(3), socket.next()).await.unwrap();
+            assert!(!matches!(ended, Some(Ok(Message::Text(_)))));
+        });
+        let (events, _rx) = mpsc::channel(8);
+        let signal = Signal::connect(&format!("ws://{address}"), "test", Duration::from_secs(2), events).await.unwrap();
+        let peer = Peer::new(RTCConfiguration::default(), "app".into(), "ice".into(), "remote".into(), signal).await.unwrap();
+        let (data, mut rx) = mpsc::channel(1);
+        let (ack, ack_rx) = oneshot::channel();
+        peer.flows.lock().unwrap().insert((1, 1), Arc::new(Flow { data, ack: Mutex::new(Some(ack)) }));
+        peer.close().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(rx.recv().await.is_none());
+            assert!(ack_rx.await.is_err());
+        }).await.unwrap();
+        assert!(peer.transport_closed());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_receive_queue_applies_backpressure_without_losing_bytes() {
+        let flows = Arc::new(Mutex::new(HashMap::new()));
+        let (data, mut rx) = mpsc::channel(1);
+        flows.lock().unwrap().insert((7, 1), Arc::new(Flow { data, ack: Mutex::new(None) }));
+        dispatch_flow(&flows, &frame(7, 1, DATA, b"first")).await;
+        let message = frame(7, 1, DATA, b"second");
+        let pending = dispatch_flow(&flows, &message);
+        tokio::pin!(pending);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut pending).await.is_err());
+        assert_eq!(rx.recv().await.unwrap(), b"first");
+        pending.await;
+        assert_eq!(rx.recv().await.unwrap(), b"second");
+        dispatch_flow(&flows, &frame(7, 1, FIN, &[])).await;
+        assert!(rx.recv().await.is_none());
+    }
 
     #[test]
     fn port_mapping_frames_round_trip() {

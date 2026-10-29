@@ -135,20 +135,31 @@ pub async fn portmap_run_rules(
         let device = device.clone();
         tokio::spawn(async move {
             let mut since_ping = std::time::Instant::now();
+            let mut missed_pings = 0u8;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 let peer = session.read().await.clone();
                 let Some(peer) = peer else { continue };
                 // 每 20s 一条探测流：刷新 TURN 租约 / NAT 映射 / SCTP 状态，
                 // 避免空闲链路被中间设备悄悄回收。
-                if since_ping.elapsed() >= std::time::Duration::from_secs(20) {
+                let mut reconnect = peer.transport_closed();
+                if !reconnect && since_ping.elapsed() >= std::time::Duration::from_secs(20) {
                     since_ping = std::time::Instant::now();
-                    peer.keepalive_ping().await;
+                    if peer.keepalive_ping().await {
+                        missed_pings = 0;
+                    } else {
+                        missed_pings += 1;
+                        log::warn!("链路探测未收到回包: consecutive_failures={missed_pings}");
+                    }
+                    reconnect = missed_pings >= 3 || peer.transport_closed();
                 }
-                if peer.wait_channel(viewer::rtc::FILE_CHANNEL, std::time::Duration::from_millis(0)).await.is_err() {
+                if reconnect {
                     *session.write().await = None;
                     log::warn!("链路已断开，准备重连");
+                    peer.close().await;
                     connect(&api, &device, &session, &backoff).await;
+                    missed_pings = 0;
+                    since_ping = std::time::Instant::now();
                 }
             }
         });

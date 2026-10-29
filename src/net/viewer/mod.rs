@@ -52,9 +52,10 @@ pub async fn join(api: &Api, device: &str, capture_type: u32) -> Result<Session,
     let offer = peer.offer().await?;
     signal.soac(offer).await?;
     {
-        let peer = peer.clone();
+        let peer = Arc::downgrade(&peer);
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
+                let Some(peer) = peer.upgrade() else { break };
                 let payload = soac_payload(event);
                 if let Err(e) = peer.receive(&payload).await {
                     log::warn!("处理信令事件失败: {e}");

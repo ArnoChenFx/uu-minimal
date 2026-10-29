@@ -47,16 +47,43 @@ pub enum Event {
     Offer(Soac),
     Candidate(Soac),
     /// 遥控端离开 / 房间被回收。
-    Released(Value),
+    Released(String),
     /// 连接已断，需要重新建房。
     Closed,
 }
 
 pub struct Signaling {
     tx: mpsc::Sender<String>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for Signaling {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// 没有 peer 标识的离开通知属于房间级事件，必须重新申请房间。
+fn release_event(name: &str, data: &Value) -> Event {
+    let id = ["ice_id", "iceId"].iter().filter_map(|key| data.get(*key)).find_map(|value| match value {
+        Value::String(id) if !id.is_empty() => Some(id.clone()),
+        Value::Number(id) => Some(id.to_string()),
+        _ => None,
+    });
+    log::info!("云端离开事件: event={name} ice_id_present={}", id.is_some());
+    match id {
+        Some(id) => Event::Released(id),
+        None => Event::Closed,
+    }
 }
 
 impl Signaling {
+    pub fn shutdown(&self) {
+        for task in &self.tasks { task.abort(); }
+    }
+
     pub async fn connect(url: &str, room_token: &str, events: mpsc::Sender<Event>) -> Result<Arc<Self>, String> {
         let ws_url = format!("{}/socket.io/?transport=websocket&EIO=4", url.trim_end_matches('/'));
         let mut request = ws_url.into_client_request().map_err(|_| "信令 URL 无效")?;
@@ -64,11 +91,13 @@ impl Signaling {
             .headers_mut()
             .insert("X-NRD-AUTH", room_token.parse().map_err(|_| "房间票据无法放进请求头")?);
 
-        let (socket, _) = connect_async(request).await.map_err(|_| "信令 WebSocket 连接失败")?;
+        let (socket, _) = tokio::time::timeout(SEND_TIMEOUT, connect_async(request)).await
+            .map_err(|_| "信令 WebSocket 连接超时")?
+            .map_err(|_| "信令 WebSocket 连接失败")?;
         let (mut write, mut read) = socket.split();
         let (tx, mut rx) = mpsc::channel::<String>(32);
 
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
                 match tokio::time::timeout(SEND_TIMEOUT, write.send(Message::Text(packet))).await {
                     Ok(Ok(())) => {}
@@ -78,7 +107,7 @@ impl Signaling {
         });
 
         let sender = tx.clone();
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let mut counter = 10u64;
             // 45/46 的文本头先到，二进制附件随后单独一帧。
             let mut pending: Option<(String, Value)> = None;
@@ -165,7 +194,9 @@ impl Signaling {
                                     }
                                 }
                                 "released" | "left" | "leave" => {
-                                    if events.send(Event::Released(data)).await.is_err() {
+                                    let event = release_event(name, &data);
+                                    let room_closed = matches!(event, Event::Closed);
+                                    if events.send(event).await.is_err() || room_closed {
                                         break;
                                     }
                                 }
@@ -204,7 +235,7 @@ impl Signaling {
             }
         });
 
-        Ok(Arc::new(Self { tx }))
+        Ok(Arc::new(Self { tx, tasks: vec![writer.abort_handle(), reader.abort_handle()] }))
     }
 
     pub async fn emit(&self, packet: String) -> Result<(), String> {
@@ -267,7 +298,48 @@ fn read_varint(bytes: &[u8], mut i: usize) -> Option<(u64, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::protobuf_varint;
+    use super::*;
+
+    #[test]
+    fn room_leave_without_peer_id_requires_reconnection() {
+        for name in ["released", "left", "leave"] {
+            for data in [serde_json::json!({}), serde_json::json!({"ice_id":""}), Value::Null] {
+                assert!(matches!(release_event(name, &data), Event::Closed));
+            }
+        }
+        for data in [serde_json::json!({"ice_id":"42"}), serde_json::json!({"iceId":42})] {
+            assert!(matches!(release_event("left", &data), Event::Released(id) if id == "42"));
+        }
+    }
+
+    #[tokio::test]
+    async fn server_room_leave_ends_old_signaling_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text("0{\"pingInterval\":25000,\"pingTimeout\":20000}".into())).await.unwrap();
+            assert_eq!(socket.next().await.unwrap().unwrap().into_text().unwrap(), "40");
+            socket.send(Message::Text("40{}".into())).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap(); // room_info
+            socket.send(Message::Text("42[\"released\",{\"ice_id\":\"peer\"}]".into())).await.unwrap();
+            socket.send(Message::Text("42[\"left\",{}]".into())).await.unwrap();
+            // 服务端不主动断 WebSocket，客户端仍必须识别房间退出。
+            let closed = tokio::time::timeout(Duration::from_secs(2), socket.next()).await.unwrap();
+            assert!(!matches!(closed, Some(Ok(Message::Text(_)))));
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let signal = Signaling::connect(&format!("ws://{address}"), "test", tx).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            assert!(matches!(rx.recv().await, Some(Event::Connected)));
+            assert!(matches!(rx.recv().await, Some(Event::Released(id)) if id == "peer"));
+            assert!(matches!(rx.recv().await, Some(Event::Closed)));
+            assert!(rx.recv().await.is_none());
+        }).await.unwrap();
+        drop(signal);
+        server.await.unwrap();
+    }
 
     #[test]
     fn reads_field_one_varint_and_skips_other_fields() {

@@ -22,7 +22,8 @@ pub async fn run() -> Result<(), String> {
     log::info!("已加载本机凭据（内容不打印）");
     let api = Arc::new(Api::new(creds));
 
-    'rooms: loop {
+    let mut stopping = false;
+    loop {
         log::info!("向云端申请房间凭据…");
         let room = match api.create_room().await {
             Ok(room) => room,
@@ -53,7 +54,7 @@ pub async fn run() -> Result<(), String> {
 
         loop {
             let event = tokio::select! {
-                _ = tokio::signal::ctrl_c() => break 'rooms,
+                _ = tokio::signal::ctrl_c() => { stopping = true; break; },
                 event = rx.recv() => match event { Some(event) => event, None => break },
             };
             match event {
@@ -75,7 +76,7 @@ pub async fn run() -> Result<(), String> {
                     match peer::answer(&transport, &sdp, signaling.clone(), client_id, ice_id.clone(), soac.app_control_id.clone()).await {
                         Ok(pc) => {
                             if let Some(old) = peers.insert(ice_id.clone(), pc) {
-                                let _ = old.close().await;
+                                close_peer(&old).await;
                             }
                             log::info!("已回复 answer: ice_id_present={} peers={}", !ice_id.is_empty(), peers.len());
                         }
@@ -93,18 +94,11 @@ pub async fn run() -> Result<(), String> {
                         None => log::warn!("收到未知 ice_id 的候选，忽略"),
                     }
                 }
-                Event::Released(data) => {
-                    let ice_id = ["ice_id", "iceId"].iter().find_map(|k| data.get(*k)).and_then(Value::as_str).map(str::to_owned);
-                    log::info!("遥控端断开: ice_id_present={}", ice_id.is_some());
-                    let closing: Vec<String> = match ice_id {
-                        Some(id) if peers.contains_key(&id) => vec![id],
-                        Some(_) => Vec::new(),
-                        None => peers.keys().cloned().collect(),
-                    };
-                    for id in closing {
-                        if let Some(pc) = peers.remove(&id) {
-                            let _ = pc.close().await;
-                        }
+                Event::Released(id) => {
+                    log::info!("遥控端断开（仅清理对应连接）");
+                    pending_ice.remove(&id);
+                    if let Some(pc) = peers.remove(&id) {
+                        close_peer(&pc).await;
                     }
                 }
                 Event::Closed => {
@@ -114,9 +108,12 @@ pub async fn run() -> Result<(), String> {
             }
         }
 
+        signaling.shutdown();
         for (_, pc) in peers.drain() {
-            let _ = pc.close().await;
+            close_peer(&pc).await;
         }
+        drop(signaling);
+        if stopping { break; }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
@@ -127,6 +124,12 @@ pub async fn run() -> Result<(), String> {
 
 fn value_text(value: &Value) -> String {
     value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())
+}
+
+async fn close_peer(pc: &webrtc::peer_connection::RTCPeerConnection) {
+    if tokio::time::timeout(Duration::from_secs(10), pc.close()).await.is_err() {
+        log::warn!("关闭旧连接超时，继续恢复房间");
+    }
 }
 
 // ---------------------------------------------------------------- 客户端子命令
