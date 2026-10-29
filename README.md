@@ -14,6 +14,8 @@
 
 克隆时需带上 submodule（内含打过补丁的 `webrtc*` vendor，与 [uu-remote-linux](https://github.com/VallierDev/uu-remote-linux) 一致）：
 
+推送到 `main` 时会自动打 tag（`v0.1.x` 递增）并在 [GitHub Releases](https://github.com/ArnoChenFx/uu-minimal/releases) 发布 `uu-minimal`（musl）、`uu-minimal-glibc`、`uu-minimal.exe` 与 `SHA256SUMS`。
+
 ```sh
 git clone --recurse-submodules https://github.com/ArnoChenFx/uu-minimal.git
 # 已有仓库：git submodule update --init --recursive
