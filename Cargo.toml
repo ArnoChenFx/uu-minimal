@@ -1,0 +1,41 @@
+[package]
+name = "uu-minimal"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal UU Remote host skeleton: QR login, room + Socket.IO signaling, WebRTC answer"
+license = "MIT"
+
+[[bin]]
+name = "uu-minimal"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+qrcode = { version = "0.14", default-features = false }
+log = "0.4"
+env_logger = "0.11"
+webrtc = "0.10"
+# 内嵌 SSH 客户端：把一条端口映射流当成 socket，不再依赖系统 ssh / ~/.ssh/config
+russh = "0.65.0"
+bytes = "1"
+# 官方 host 可能用 gzip_sdp 回 answer
+flate2 = "1"
+libc = "0.2"
+# 终端会话：openpty + Winsize（与主程序同样的特性集）
+nix = { version = "0.29", features = ["term", "process", "fs", "ioctl", "signal"] }
+
+# 与主程序一致：使用仓库内打过补丁的 webrtc（data channel 收包缓冲、SRTP ROC、DTLS）。
+[patch.crates-io]
+webrtc = { path = "../vendor/webrtc" }
+webrtc-dtls = { path = "../vendor/webrtc-dtls" }
+webrtc-srtp = { path = "../vendor/webrtc-srtp" }
