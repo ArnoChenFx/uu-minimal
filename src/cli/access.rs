@@ -15,7 +15,11 @@ pub async fn portmap_command(args: &[String]) -> Result<(), String> {
     let device = args.require_device()?;
     let positional = args.positionals();
     if positional.len() != 3 {
-        return Err("用法: uu-minimal portmap --device <id> <本地端口> <目标主机> <目标端口>".into());
+        return Err(
+            "用法: uu-minimal portmap --device <id> [--bind 127.0.0.1|0.0.0.0|…] \
+             <本地端口> <目标主机> <目标端口>"
+                .into(),
+        );
     }
     let local: u16 = positional[0].parse().map_err(|_| "本地端口无效".to_string())?;
     let port: u16 = positional[2].parse().map_err(|_| "目标端口无效".to_string())?;

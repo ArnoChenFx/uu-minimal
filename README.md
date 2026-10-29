@@ -59,6 +59,9 @@ uu-minimal list                 # TTY 进菜单；管道只打印
 uu-minimal portmap --device <id> 2222 127.0.0.1 22
 ssh -p 2222 me@127.0.0.1
 
+# 监听所有网卡，供局域网其它设备使用（默认 --bind 127.0.0.1）
+uu-minimal portmap --device <id> --bind 0.0.0.0 2222 127.0.0.1 22
+
 uu-minimal ssh --device <id> --user me
 uu-minimal ssh --device <id> --user me --command "uname -a"
 
