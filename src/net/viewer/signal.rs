@@ -24,9 +24,20 @@ pub struct Signal {
     out: mpsc::Sender<Message>,
     ack: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next: AtomicU64,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for Signal {
+    fn drop(&mut self) {
+        for task in &self.tasks { task.abort(); }
+    }
 }
 
 impl Signal {
+    pub fn shutdown(&self) {
+        for task in &self.tasks { task.abort(); }
+    }
+
     pub async fn connect(server: &str, room_token: &str, timeout: Duration, events: mpsc::Sender<Value>) -> Result<Arc<Self>, String> {
         let url = format!("{}/socket.io/?transport=websocket&EIO=4", server.trim_end_matches('/'));
         let mut request = url.into_client_request().map_err(|_| "信令 URL 无效")?;
@@ -41,9 +52,9 @@ impl Signal {
         let (out, mut out_rx) = mpsc::channel::<Message>(64);
         let ack: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        tokio::spawn(async move {
+        let write_task = tokio::spawn(async move {
             while let Some(message) = out_rx.recv().await {
-                if write.send(message).await.is_err() {
+                if !matches!(tokio::time::timeout(Duration::from_secs(10), write.send(message)).await, Ok(Ok(()))) {
                     break;
                 }
             }
@@ -55,7 +66,7 @@ impl Signal {
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let ready = Arc::new(Mutex::new(Some(ready_tx)));
         let ready_reader = ready.clone();
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             let mut window = Duration::from_secs(45);
             let mut deadline = tokio::time::Instant::now() + window;
             loop {
@@ -142,11 +153,13 @@ impl Signal {
         });
 
         // 命名空间没连上就发 control，云端不会回 ack（表现为“等待 control ack 超时”）。
+        let signal = Arc::new(Self { out, ack, next: AtomicU64::new(1),
+            tasks: vec![write_task.abort_handle(), read_task.abort_handle()] });
         tokio::time::timeout(timeout, ready_rx)
             .await
             .map_err(|_| "信令握手超时：未收到 Socket.IO connect 确认")?
             .map_err(|_| "信令连接已关闭".to_string())?;
-        Ok(Arc::new(Self { out, ack, next: AtomicU64::new(1) }))
+        Ok(signal)
     }
 
     /// `control` + 一帧二进制 ConnectOptions；返回 ack 体（含 iceServers / client_id / ice_id）。
