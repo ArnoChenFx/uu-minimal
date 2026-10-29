@@ -73,7 +73,7 @@ jobs:
             target: x86_64-pc-windows-gnu
             artifact: uu-minimal.exe
             bin: uu-minimal.exe
-            apt: mingw-w64
+            apt: mingw-w64 nasm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
