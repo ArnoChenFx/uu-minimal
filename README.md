@@ -85,6 +85,10 @@ uu-minimal portmap --device <id> \
 # 监听所有网卡（默认 --bind 127.0.0.1）
 uu-minimal portmap --device <id> --bind 0.0.0.0 --map 2222,127.0.0.1,22
 
+# 非抢占模式：已有控制端时等待重试，不会把它踢掉；自动重连也沿用此模式
+uu-minimal portmap --device <id> --no-force-join \
+  --map 43425,127.0.0.1,3425 --map 43430,127.0.0.1,3430
+
 uu-minimal ssh --device <id> --user me
 uu-minimal ssh --device <id> --user me --command "uname -a"
 
@@ -99,7 +103,11 @@ uu-minimal sftp --device <id> me@127.0.0.1   # exec 系统 sftp，ProxyCommand �
 
 `list` 顶部「本机」来自 `current_device`（名字字段是 `alias`），不在自有/共享列表里，也不进选择菜单；`controllable` 为假表示官方客户端连不进来。菜单项是 ssh、sftp、portmap（占到 Ctrl-C）。ssh 与 portmap 各占一条 WebRTC，**不要同时开**；同一 device **不要开两个 portmap 进程**，多端口用 **`--map` 重复**（见上）。ssh 退出后菜单会重新 join。
 
-`join` 带 `force_join: true`；`ice_id` 以云端 ack 为准；offer 补 `a=x-uuremote-quic`。官方 host 可能用二进制事件加 gzip_sdp 回 answer。一条 Message 27 流就是一条 TCP。
+`ssh`、`sftp`、`tunnel`、`portmap` 都支持 `--no-force-join`，使 `join` 发送 `force_join: false`。`portmap` 初次连接与断线重连均保持非抢占，失败按 0.5s、1s、2s…最多 30s 退避重试；另外三个命令连接失败直接返回错误。设备是否可接入由云端判断，程序不会把所有失败都解释成“设备被占用”，也不会自动升级为强制抢占。
+
+同一被控设备仍只能有一台控制设备在线，非抢占模式用于等待接入，不能实现两台独立控制端同时映射。需要同时使用时，可共享一台 Linux 上的 portmap 入口。希望避免互踢的各个控制端都应加此选项；未加选项的控制端、交互菜单及官方客户端仍可能抢占当前连接。
+
+默认 `join` 仍带 `force_join: true`，保持旧版行为；`ice_id` 以云端 ack 为准；offer 补 `a=x-uuremote-quic`。官方 host 可能用二进制事件加 gzip_sdp 回 answer。一条 Message 27 流就是一条 TCP。
 
 ## 被控与安全
 
