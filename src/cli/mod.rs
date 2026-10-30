@@ -32,8 +32,10 @@ uu-minimal — UU 远程的最小可用骨架（登录 · 组网 · 终端 · �
                                  stdio 桥，给系统 ssh 的 ProxyCommand 用
   portmap --device <id> [--bind 地址] <本地端口> <目标主机> <目标端口>
            或多条: --map 本地,主机,端口（可重复，共享一条 WebRTC）
-                                 同一 device 勿开两个 portmap 进程（会互相顶掉）；
+                                 默认会抢占同一 device 的已有控制端；
                                  多端口请在一个进程里用多个 --map；--bind 0.0.0.0 可局域网连入
+  --no-force-join                 上述 ssh/sftp/tunnel/portmap 均可用：不抢占已有控制端
+                                 portmap 连接失败会退避重试，其他命令返回错误；不支持同时在线
 
 本机被控（仅桌面 Linux）:
   run                            host 端：建房、回 answer、服务终端与端口映射

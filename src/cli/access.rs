@@ -17,7 +17,7 @@ pub async fn portmap_command(args: &[String]) -> Result<(), String> {
     let device = args.require_device()?;
     let bind = args.value("--bind").unwrap_or("127.0.0.1").to_owned();
     let rules = parse_portmap_rules(&args)?;
-    portmap_run_rules(device, &bind, &rules).await
+    portmap_run_rules(device, &bind, &rules, !args.flag("--no-force-join")).await
 }
 
 fn parse_portmap_rule(spec: &str) -> Result<(u16, String, u16), String> {
@@ -57,7 +57,7 @@ fn parse_portmap_rules(args: &Args<'_>) -> Result<Vec<(u16, String, u16)>, Strin
              或多条映射（共享一条 WebRTC，可开多个本地端口）:\n\
                uu-minimal portmap --device <id> [--bind 地址] \\\n\
                  --map 2222,127.0.0.1,22 --map 3389,192.168.0.10,3389\n\
-             同一 --device 不要开两个 portmap 进程（会 force_join 互相顶掉）；多端口请用多个 --map。"
+             --no-force-join 不抢占已有控制端，连接失败会等待重试；多端口请用多个 --map。"
                 .into(),
         );
     }
@@ -71,16 +71,17 @@ pub async fn portmap_run(device: &str, local: u16, host: &str, port: u16) -> Res
 }
 
 pub async fn portmap_run_bind(device: &str, bind: &str, local: u16, host: &str, port: u16) -> Result<(), String> {
-    portmap_run_rules(device, bind, &[(local, host.to_owned(), port)]).await
+    portmap_run_rules(device, bind, &[(local, host.to_owned(), port)], true).await
 }
 
-/// 多条本地映射共享一次 `join`（同一 device 只能有一条 viewer WebRTC；多进程 portmap 会互相 force_join）。
+/// 多条本地映射共享一次 `join`；force_join=false 时等待接入，不抢占已有控制端。
 /// `bind` 可选：`--bind 0.0.0.0` 让局域网其它机器也能连入。
 /// WebRTC 断线自动重连，失败后从 0.5s 开始退避，最多 30s。
 pub async fn portmap_run_rules(
     device: &str,
     bind: &str,
     rules: &[(u16, String, u16)],
+    force_join: bool,
 ) -> Result<(), String> {
     if rules.is_empty() {
         return Err("至少一条端口映射".into());
@@ -96,36 +97,6 @@ pub async fn portmap_run_rules(
     // 会话槽：None = 正在重连；重连只在这里发生，accept 循环永远不退出。
     let session: Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>> = Arc::new(tokio::sync::RwLock::new(None));
     let session_ready = Arc::new(tokio::sync::Notify::new());
-
-    async fn connect(
-        api: &Arc<Api>,
-        device: &str,
-        session: &Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>>,
-        session_ready: &tokio::sync::Notify,
-    ) {
-        let mut backoff = crate::net::retry::Backoff::new();
-        let started = std::time::Instant::now();
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            match viewer::join(api, device, viewer::signal::CAPTURE_PORT_MAP).await {
-                Ok(s) => {
-                    *session.write().await = Some(s.peer);
-                    session_ready.notify_one();
-                    println!("{}", ui::bold("链路已连接"));
-                    if attempts > 1 {
-                        println!("  （本轮尝试 {attempts} 次，耗时 {}ms）", started.elapsed().as_millis());
-                    }
-                    return;
-                }
-                Err(e) => {
-                    let delay = backoff.delay();
-                    log::warn!("连接失败（{}ms 后重试）: {e}", delay.as_millis());
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-    }
 
     // 后台监控：状态回调唤醒硬断线处理，探测只负责识别仍显示 Open 的假在线。
     {
@@ -164,7 +135,7 @@ pub async fn portmap_run_rules(
                 *session.write().await = None;
                 log::warn!("链路已断开，准备重连");
                 peer.close().await;
-                connect(&api, &device, &session, &session_ready).await;
+                connect_portmap(&api, &device, &session, &session_ready, force_join).await;
             }
         });
     }
@@ -177,7 +148,10 @@ pub async fn portmap_run_rules(
         ui::hint("  注意: 监听所有网卡，本机所在网络的其它设备均可使用此隧道");
     }
     ui::hint("  Ctrl-C 退出；链路断开会自动重连");
-    connect(&api, &device, &session, &session_ready).await;
+    if !force_join {
+        ui::hint("  非抢占模式：不顶掉已有控制端；连接失败会等待重试");
+    }
+    connect_portmap(&api, &device, &session, &session_ready, force_join).await;
 
     for (local, host, port) in rules {
         let listener = tokio::net::TcpListener::bind((bind_addr, *local))
@@ -200,6 +174,37 @@ pub async fn portmap_run_rules(
 
     tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+async fn connect_portmap(
+    api: &Api,
+    device: &str,
+    session: &tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>,
+    session_ready: &tokio::sync::Notify,
+    force_join: bool,
+) {
+    let mut backoff = crate::net::retry::Backoff::new();
+    let started = std::time::Instant::now();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match viewer::join(api, device, viewer::signal::CAPTURE_PORT_MAP, force_join).await {
+            Ok(s) => {
+                *session.write().await = Some(s.peer);
+                session_ready.notify_one();
+                println!("{}", ui::bold("链路已连接"));
+                if attempts > 1 {
+                    println!("  （本轮尝试 {attempts} 次，耗时 {}ms）", started.elapsed().as_millis());
+                }
+                return;
+            }
+            Err(e) => {
+                let delay = backoff.delay();
+                log::warn!("连接失败（{}ms 后重试）: {e}", delay.as_millis());
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
 }
 
 async fn accept_portmap_stream(
@@ -254,6 +259,7 @@ pub async fn ssh_command(args: &[String]) -> Result<(), String> {
         args.value("--key").map(std::path::PathBuf::from),
         args.value("--command").map(str::to_owned),
         args.value("--password").map(str::to_owned),
+        !args.flag("--no-force-join"),
     )
     .await
 }
@@ -266,10 +272,11 @@ async fn ssh_session(
     key: Option<std::path::PathBuf>,
     command: Option<String>,
     password: Option<String>,
+    force_join: bool,
 ) -> Result<(), String> {
     let user = if user.trim().is_empty() { current_user() } else { user.trim().to_owned() };
     let api = loaded_api()?;
-    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP).await?;
+    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP, force_join).await?;
     let flow = session.peer.open_flow(host, port).await?;
     let known_hosts = config::path().with_file_name("known_hosts");
     russh_client::run(
@@ -293,7 +300,7 @@ pub async fn tunnel_command(args: &[String]) -> Result<(), String> {
     let port: u16 = positional[1].parse().map_err(|_| "端口无效".to_string())?;
 
     let api = loaded_api()?;
-    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP).await?;
+    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP, !args.flag("--no-force-join")).await?;
     let flow = session.peer.open_flow(host, port).await?;
     let (writer, mut reader) = flow.into_parts();
 
@@ -335,12 +342,17 @@ pub async fn sftp_command(args: &[String]) -> Result<(), String> {
     let device = args.require_device()?;
     // 其余位置参数原样交给系统 sftp（`用户@主机`、路径、-P 之类）。
     let extra: Vec<String> = args.positionals().into_iter().map(str::to_owned).collect();
-    spawn_sftp(device, &extra).await
+    spawn_sftp(device, &extra, !args.flag("--no-force-join")).await
 }
 
-async fn spawn_sftp(device: &str, extra: &[String]) -> Result<(), String> {
+fn sftp_proxy(exe: &std::path::Path, device: &str, force_join: bool) -> String {
+    let mode = if force_join { "" } else { " --no-force-join" };
+    format!("{} tunnel --device {}{mode} %h %p", exe.display(), device)
+}
+
+async fn spawn_sftp(device: &str, extra: &[String], force_join: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("找不到自身路径: {e}"))?;
-    let proxy = format!("{} tunnel --device {} %h %p", exe.display(), device);
+    let proxy = sftp_proxy(&exe, device, force_join);
     let mut command = tokio::process::Command::new("sftp");
     command.arg("-o").arg(format!("ProxyCommand={proxy}")).args(extra);
     let status = command.status().await.map_err(|e| format!("启动 sftp 失败: {e}"))?;
@@ -392,11 +404,14 @@ pub fn loaded_api() -> Result<Api, String> {
 
 
 pub async fn exec_ssh(device: &str, host: &str, port: u16, user: &str) -> Result<(), String> {
-    ssh_session(device, host, port, user, None, None, None).await
+    ssh_session(device, host, port, user, None, None, None, true).await
 }
 
 pub async fn exec_sftp(device: &str, host: &str, user: &str, path: &str) -> Result<(), String> {
     let target = if user.trim().is_empty() { host.to_owned() } else { format!("{}@{}", user.trim(), host) };
     let target = if path.trim().is_empty() { target } else { format!("{target}:{}", path.trim()) };
-    spawn_sftp(device, &[target]).await
+    spawn_sftp(device, &[target], true).await
 }
+
+#[cfg(test)]
+mod tests;

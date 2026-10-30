@@ -62,6 +62,7 @@ impl std::fmt::Debug for RoomData {
 pub struct Api {
     pub creds: Credentials,
     http: reqwest::Client,
+    base_url: String,
 }
 
 impl Api {
@@ -75,7 +76,13 @@ impl Api {
             .timeout(Duration::from_secs(12))
             .build()
             .expect("HTTP client");
-        Self { creds, http }
+        Self { creds, http, base_url: BASE_URL.into() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_url(base_url: String) -> Self {
+        Self { creds: Credentials { sign_key: "synthetic-key".into(), ..Default::default() },
+            http: reqwest::Client::builder().no_proxy().build().unwrap(), base_url }
     }
 
     /// HMAC-SHA256(method + path + 排序后的 x-param-* + body)
@@ -153,7 +160,7 @@ impl Api {
         let body_str = body.map(serde_json::to_string).transpose().map_err(|e| e.to_string())?.unwrap_or_default();
         let resp = self
             .http
-            .post(format!("{BASE_URL}{path}"))
+            .post(format!("{}{path}", self.base_url))
             .timeout(timeout)
             .headers(self.build_headers("POST", path, &body_str))
             .body(body_str)
@@ -173,7 +180,7 @@ impl Api {
     pub async fn get(&self, path: &str) -> Result<(u16, Value), String> {
         let resp = self
             .http
-            .get(format!("{BASE_URL}{path}"))
+            .get(format!("{}{path}", self.base_url))
             .headers(self.build_headers("GET", path, ""))
             .send()
             .await
@@ -197,12 +204,12 @@ impl Api {
     }
 
     /// POST /api/v1/room/join/by_device/{device}：以 viewer 身份加入。
-    /// `force_join` 抢占已有会话——CLI 隧道被一条陈旧会话挡住比被踢更糟。
-    pub async fn join_room(&self, device: &str) -> Result<RoomData, RoomError> {
+    /// `force_join=false` 不抢占已有会话；失败时由调用方决定是否等待重试。
+    pub async fn join_room(&self, device: &str, force_join: bool) -> Result<RoomData, RoomError> {
         let segment = device_segment(device).map_err(RoomError::Other)?;
         let path = format!("/api/v1/room/join/by_device/{segment}");
         let (status, body) = self
-            .post_with_timeout(&path, Some(&serde_json::json!({"force_join": true})), Duration::from_secs(15))
+            .post_with_timeout(&path, Some(&serde_json::json!({"force_join": force_join})), Duration::from_secs(15))
             .await
             .map_err(RoomError::Other)?;
         let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);

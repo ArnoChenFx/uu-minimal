@@ -22,8 +22,8 @@ pub struct Session {
 }
 
 /// 设备鉴权 + 建房 + 信令 + offer/answer，直到 FILE 通道可用。
-pub async fn join(api: &Api, device: &str, capture_type: u32) -> Result<Session, String> {
-    let room = api.join_room(device).await.map_err(|e| e.to_string())?;
+pub async fn join(api: &Api, device: &str, capture_type: u32, force_join: bool) -> Result<Session, String> {
+    let room = api.join_room(device, force_join).await.map_err(|e| e.to_string())?;
     let server = room.server().to_owned();
     if server.is_empty() || room.token.is_empty() {
         return Err("房间信息不完整（缺信令地址或票据）".into());
