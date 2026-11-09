@@ -1,6 +1,6 @@
 [package]
 name = "uu-minimal"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 publish = false
 description = "Minimal UU Remote host skeleton: QR login, room + Socket.IO signaling, WebRTC answer"
