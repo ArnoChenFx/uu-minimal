@@ -27,7 +27,7 @@ cargo build --release
 
 默认启用终端功能；无 PTY 环境可用 `cargo build --release --no-default-features` 关闭终端，保留组网、端口映射和文件传输。
 
-依赖全部来自 crates.io：WebRTC 用上游 `webrtc 0.21.x`（sans-IO 重写后的形态），没有 `[patch.crates-io]`，也不依赖任何本地 `vendor` 目录，拷走整个目录即可独立编译。
+WebRTC 使用上游 `webrtc 0.21.x`（sans-IO 重写后的形态）。`rtc-turn 0.21.1` 的 nonce 刷新存在已知缺陷，因此仅对这个依赖使用 `patches/rtc-turn` 中的源码补丁；其余依赖来自 crates.io，无需 `vendor-src` 子模块。详见 [补丁说明](patches/rtc-turn/PATCHES.md)。
 
 日志默认本程序 `info`，`webrtc*` / `russh` 压到 `warn`。`ssh` / `sftp` / `tunnel` 默认静音（独占终端）。`RUST_LOG` 优先，例如 `RUST_LOG=info,webrtc_ice=debug`；`NO_COLOR=1` 关颜色。
 
