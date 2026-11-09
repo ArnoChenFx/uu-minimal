@@ -10,7 +10,12 @@ use crate::cli::ui;
 use crate::cloud::api::Api;
 use crate::cloud::config;
 use crate::cloud::creds::Credentials;
-use crate::net::viewer::{self, rtc::FlowHandle, ssh as russh_client};
+use crate::net::controller::{self, rtc::FlowHandle, ssh as russh_client};
+
+/// SSH / stdio 桥在信令或 WebRTC 链路断开时的统一提示。
+fn link_lost() -> String {
+    "连接已断开：信令或 WebRTC 链路丢失".into()
+}
 
 pub async fn portmap_command(args: &[String]) -> Result<(), String> {
     let args = Args::new(args);
@@ -95,7 +100,7 @@ pub async fn portmap_run_rules(
     let api = Arc::new(loaded_api()?);
 
     // 会话槽：None = 正在重连；重连只在这里发生，accept 循环永远不退出。
-    let session: Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>> = Arc::new(tokio::sync::RwLock::new(None));
+    let session: Arc<tokio::sync::RwLock<Option<Arc<controller::rtc::Peer>>>> = Arc::new(tokio::sync::RwLock::new(None));
     let session_ready = Arc::new(tokio::sync::Notify::new());
 
     // 后台监控：状态回调唤醒硬断线处理，探测只负责识别仍显示 Open 的假在线。
@@ -179,7 +184,7 @@ pub async fn portmap_run_rules(
 async fn connect_portmap(
     api: &Api,
     device: &str,
-    session: &tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>,
+    session: &tokio::sync::RwLock<Option<Arc<controller::rtc::Peer>>>,
     session_ready: &tokio::sync::Notify,
     force_join: bool,
 ) {
@@ -188,7 +193,7 @@ async fn connect_portmap(
     let mut attempts = 0;
     loop {
         attempts += 1;
-        match viewer::join(api, device, viewer::signal::CAPTURE_PORT_MAP, force_join).await {
+        match controller::join(api, device, controller::signal::CAPTURE_PORT_MAP, force_join).await {
             Ok(s) => {
                 *session.write().await = Some(s.peer);
                 session_ready.notify_one();
@@ -208,7 +213,7 @@ async fn connect_portmap(
 }
 
 async fn accept_portmap_stream(
-    session: Arc<tokio::sync::RwLock<Option<Arc<viewer::rtc::Peer>>>>,
+    session: Arc<tokio::sync::RwLock<Option<Arc<controller::rtc::Peer>>>>,
     host: &str,
     port: u16,
     socket: tokio::net::TcpStream,
@@ -276,15 +281,20 @@ async fn ssh_session(
 ) -> Result<(), String> {
     let user = if user.trim().is_empty() { current_user() } else { user.trim().to_owned() };
     let api = loaded_api()?;
-    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP, force_join).await?;
+    let session = controller::join(&api, device, controller::signal::CAPTURE_PORT_MAP, force_join).await?;
     let flow = session.peer.open_flow(host, port).await?;
     let known_hosts = config::path().with_file_name("known_hosts");
-    russh_client::run(
+    let mut closed = session.closed.clone();
+    let run = russh_client::run(
         flow,
         host,
         russh_client::Options { user, port, password, key, command, known_hosts },
-    )
-    .await
+    );
+    tokio::select! {
+        result = run => result,
+        // 链路断了要报错退出，不能让本地终端卡在一个已经死掉的会话上。
+        _ = closed.changed() => Err(link_lost()),
+    }
 }
 
 /// stdio 桥：给 `ssh -o ProxyCommand=…` / `sftp -o ProxyCommand=…` 用。
@@ -300,7 +310,7 @@ pub async fn tunnel_command(args: &[String]) -> Result<(), String> {
     let port: u16 = positional[1].parse().map_err(|_| "端口无效".to_string())?;
 
     let api = loaded_api()?;
-    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP, !args.flag("--no-force-join")).await?;
+    let session = controller::join(&api, device, controller::signal::CAPTURE_PORT_MAP, !args.flag("--no-force-join")).await?;
     let flow = session.peer.open_flow(host, port).await?;
     let (writer, mut reader) = flow.into_parts();
 
@@ -330,9 +340,12 @@ pub async fn tunnel_command(args: &[String]) -> Result<(), String> {
             let _ = stdout.flush().await;
         }
     };
+    let mut closed = session.closed.clone();
     tokio::select! {
         _ = up => {}
         _ = down => {}
+        // stdio 桥是给 `ssh`/`sftp` 当 ProxyCommand 用的：链路断了必须非零退出。
+        _ = closed.changed() => return Err(link_lost()),
     }
     Ok(())
 }

@@ -87,7 +87,7 @@ async fn viewer_join_sends_selected_policy_without_forced_fallback() {
     for options in [vec![], vec!["--no-force-join".to_owned()]] {
         let force_join = !Args::new(&options).flag("--no-force-join");
         let result = tokio::time::timeout(Duration::from_secs(2),
-            viewer::join(&api, "synthetic-device", viewer::signal::CAPTURE_PORT_MAP, force_join)).await.unwrap();
+            controller::join(&api, "synthetic-device", controller::signal::CAPTURE_PORT_MAP, force_join)).await.unwrap();
         assert!(matches!(result, Err(error) if error == "join http 409 code 9999"));
         let (body, _) = requests.recv().await.unwrap();
         assert_eq!(body, json!({"force_join": force_join}));
