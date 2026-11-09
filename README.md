@@ -29,8 +29,6 @@ cargo build --release
 
 依赖全部来自 crates.io：WebRTC 用上游 `webrtc 0.21.x`（sans-IO 重写后的形态），没有 `[patch.crates-io]`，也不依赖任何本地 `vendor` 目录，拷走整个目录即可独立编译。
 
-`vendor-src` 子模块保留 [uu-remote-linux](https://github.com/VallierDev/uu-remote-linux) 的参考源码，不参与当前构建。获取固定版本用 `git submodule update --init --recursive`；跟进其最新 `main` 用 `git submodule update --remote --recursive vendor-src`，更新后需提交子模块指针。
-
 日志默认本程序 `info`，`webrtc*` / `russh` 压到 `warn`。`ssh` / `sftp` / `tunnel` 默认静音（独占终端）。`RUST_LOG` 优先，例如 `RUST_LOG=info,webrtc_ice=debug`；`NO_COLOR=1` 关颜色。
 
 `run` 收到房间级离开通知后会重新建房；短暂 ICE `Disconnected` 保留端口映射 TCP 流，明确 `Failed` / `Closed` 才清理。控制端 `portmap` 在通道关闭、PeerConnection 失败，或连续三次探测无回包后重连；被控端恢复后无需手动重启 `portmap`。重连会建立新链路，已经断开的业务 TCP 连接仍需业务客户端重新建立。
