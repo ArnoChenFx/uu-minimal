@@ -1,6 +1,6 @@
 [package]
 name = "uu-minimal"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 publish = false
 description = "Minimal UU Remote host skeleton: QR login, room + Socket.IO signaling, WebRTC answer"
@@ -44,10 +44,13 @@ libc = "0.2"
 # 终端会话：openpty + Winsize（与主程序同样的特性集）；只被 `terminal` feature 用到
 nix = { version = "0.29", features = ["term", "process", "fs", "ioctl", "signal"], optional = true }
 
-# 传输层一律用 crates.io 上的上游 webrtc，不做任何 [patch.crates-io]，也不要指回本地目录。
+# WebRTC 使用 crates.io 0.21；仅 rtc-turn 0.21.1 携带 nonce 刷新修复，见 patches/rtc-turn/PATCHES.md。
 #
 # 版本 0.21.x（上游 sans-IO 重写后的形态）：`rtc` 是纯 sans-IO 核心，`webrtc` 是它上面的
 # async 胶水（内部自动跑 driver，调用方照样 await）。事件从「注册闭包」改成实现
 # `PeerConnectionEventHandler`，通道消息改成 `channel.poll()` 拿 `DataChannelEvent`。
 # 0.21 还必须用 `with_udp_addrs` 显式给本地 socket，且 `with_interface_filter` 被上游注释掉了，
 # 网卡过滤改由 `net::ice::udp_bind_addrs` 承担。
+
+[patch.crates-io]
+rtc-turn = { path = "patches/rtc-turn" }

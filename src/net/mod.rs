@@ -6,3 +6,6 @@ pub mod ice;
 pub mod peer;
 pub(crate) mod retry;
 pub mod signaling;
+
+#[cfg(test)]
+mod turn_tests;
