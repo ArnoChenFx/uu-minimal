@@ -1,0 +1,4 @@
+[submodule "vendor-src"]
+	path = vendor-src
+	url = https://github.com/VallierDev/uu-remote-linux.git
+	branch = main
