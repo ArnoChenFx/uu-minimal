@@ -34,29 +34,26 @@ pub fn write(cfg: &serde_json::Value) -> Result<PathBuf, String> {
     let dir = path.parent().ok_or("config path has no parent")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .and_then(|mut f| {
-                f.write_all(serde_json::to_string_pretty(cfg).unwrap_or_default().as_bytes())?;
-                f.sync_all()
-            })
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp, serde_json::to_string_pretty(cfg).unwrap_or_default())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))?;
-    }
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = open_private(&tmp).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    f.write_all(serde_json::to_string_pretty(cfg).unwrap_or_default().as_bytes())
+        .map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    drop(f);
+    std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// Unix 上以 0600 建文件；Windows 没有等价位，交给目录 ACL（用户配置目录默认就是私有的）。
+#[cfg(unix)]
+fn open_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)
 }
 
 /// 冒充的平台：决定设备注册路径、`x-param-plat` 与 ConnectOptions 的 platform 字段。

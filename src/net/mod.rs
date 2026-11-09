@@ -1,7 +1,8 @@
-//! 传输层：信令与 PeerConnection（被控端），以及 viewer 那条链路。
+//! 传输层：信令与 PeerConnection（被控端），以及控制端那条链路。
 
+pub mod controller;
+pub mod fast;
 pub mod ice;
 pub mod peer;
 pub(crate) mod retry;
 pub mod signaling;
-pub mod viewer;

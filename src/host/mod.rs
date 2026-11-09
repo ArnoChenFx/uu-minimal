@@ -1,12 +1,19 @@
 //! 被控端：`run` 的房间循环，以及终端与端口映射两条数据通道。
 
+pub mod file_transfer;
 pub mod portmap;
+/// 终端会话能力（openpty + shell）。`--no-default-features` 时退化成空实现，
+/// 数据面代码不需要任何 `cfg`。
+#[cfg(feature = "terminal")]
+pub mod terminal;
+#[cfg(not(feature = "terminal"))]
+#[path = "terminal_stub.rs"]
 pub mod terminal;
 
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::cloud::api::{Api, RoomError};
@@ -15,6 +22,9 @@ use crate::cloud::creds::Credentials;
 use crate::net::ice;
 use crate::net::peer;
 use crate::net::signaling::{Event, Signaling};
+
+/// `be-controlled` 到 offer 之间允许的最长间隔；超过就认为这份 ICE 配置已经没用了。
+const ICE_TTL: Duration = Duration::from_secs(60);
 
 pub async fn run() -> Result<(), String> {
     let file = config::read()?;
@@ -49,12 +59,14 @@ pub async fn run() -> Result<(), String> {
                 continue;
             }
         };
-
         let room_started = std::time::Instant::now();
         // 一个 ice_id = 一个 peer（桌面 / 文件 / 终端 / 端口映射各一条）。
-        let mut pending_ice: HashMap<String, ice::SessionIce> = HashMap::new();
-        let mut fallback_ice: Option<ice::SessionIce> = None;
-        let mut peers: HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>> = HashMap::new();
+        // pending_ice 带时间戳：凭据过期后不能拿来建连。
+        let mut pending_ice: HashMap<String, (ice::SessionIce, u64, Instant)> = HashMap::new();
+        let mut fallback_ice: Option<(ice::SessionIce, u64, Instant)> = None;
+        // 表要交给 handler：连接断掉时由它摘掉自己，否则重连一次就多一条死 peer。
+        let peers: Arc<StdMutex<HashMap<String, Arc<dyn webrtc::peer_connection::PeerConnection>>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
 
         loop {
             let event = tokio::select! {
@@ -67,31 +79,53 @@ pub async fn run() -> Result<(), String> {
                     log::info!("准备接受连接: capture_type={capture_type} ice_id_present={}", ice_id.is_some());
                     match ice_id {
                         Some(id) => {
-                            pending_ice.insert(id, ice);
+                            pending_ice.insert(id, (ice, capture_type, Instant::now()));
                         }
-                        None => fallback_ice = Some(ice),
+                        None => fallback_ice = Some((ice, capture_type, Instant::now())),
                     }
                 }
                 Event::Offer(soac) => {
                     let ice_id = soac.ice_id.as_ref().map(value_text).unwrap_or_default();
                     let client_id = soac.client_id.clone().unwrap_or_default();
-                    let transport = pending_ice.remove(&ice_id).or_else(|| fallback_ice.take()).unwrap_or_default();
+                    // capture_type 和 ICE 配置一起记：offer 来的时候才知道这次是不是桌面（要不要推画面）。
+                    let taken = pending_ice.remove(&ice_id).or_else(|| fallback_ice.take());
+                    let Some((transport, capture_type, _)) = taken.filter(|(_, _, at)| at.elapsed() <= ICE_TTL) else {
+                        // 没有 be-controlled 前置（或凭据已过期）就去建连，只会拿一份空 ICE
+                        // 配置换回一条连不上的连接，不如明确拒绝。
+                        log::error!("offer 没有可用的 be-controlled 前置（ice_id_present={}），拒绝", !ice_id.is_empty());
+                        continue;
+                    };
                     let sdp = soac.sdp.clone().unwrap_or_default();
-                    match peer::answer(&transport, &sdp, signaling.clone(), client_id, ice_id.clone(), soac.app_control_id.clone()).await {
+                    match peer::answer(
+                        &transport,
+                        &sdp,
+                        signaling.clone(),
+                        client_id,
+                        ice_id.clone(),
+                        soac.app_control_id.clone(),
+                        peers.clone(),
+                        capture_type,
+                    )
+                    .await
+                    {
                         Ok(pc) => {
-                            if let Some(old) = peers.insert(ice_id.clone(), pc) {
+                            // 同一 ice_id 重连时替换旧连接；guard 不能跨 await，先取出来再关。
+                            let old = { peers.lock().unwrap().insert(ice_id.clone(), pc) };
+                            if let Some(old) = old {
                                 close_peer(&old).await;
                             }
-                            log::info!("已回复 answer: ice_id_present={} peers={}", !ice_id.is_empty(), peers.len());
+                            let count = peers.lock().unwrap().len();
+                            log::info!("已回复 answer: ice_id_present={} peers={count}", !ice_id.is_empty());
                         }
                         Err(e) => log::error!("处理 offer 失败: {e}"),
                     }
                 }
                 Event::Candidate(soac) => {
                     let ice_id = soac.ice_id.as_ref().map(value_text).unwrap_or_default();
-                    match peers.get(&ice_id) {
+                    let target = { peers.lock().unwrap().get(&ice_id).cloned() };
+                    match target {
                         Some(pc) => {
-                            if let Err(e) = peer::add_candidate(pc, &soac).await {
+                            if let Err(e) = peer::add_candidate(&pc, &soac).await {
                                 log::warn!("{e}");
                             }
                         }
@@ -101,7 +135,8 @@ pub async fn run() -> Result<(), String> {
                 Event::Released(id) => {
                     log::info!("遥控端断开（仅清理对应连接）");
                     pending_ice.remove(&id);
-                    if let Some(pc) = peers.remove(&id) {
+                    let pc = { peers.lock().unwrap().remove(&id) };
+                    if let Some(pc) = pc {
                         close_peer(&pc).await;
                     }
                 }
@@ -114,7 +149,8 @@ pub async fn run() -> Result<(), String> {
 
         let room_lifetime = room_started.elapsed();
         signaling.shutdown();
-        futures_util::future::join_all(peers.drain().map(|(_, pc)| async move {
+        let drained: Vec<_> = peers.lock().unwrap().drain().map(|(_, pc)| pc).collect();
+        futures_util::future::join_all(drained.into_iter().map(|pc| async move {
             close_peer(&pc).await;
         })).await;
         drop(signaling);
@@ -142,7 +178,7 @@ async fn wait_retry(delay: Duration) -> bool {
     }
 }
 
-async fn close_peer(pc: &webrtc::peer_connection::RTCPeerConnection) {
+async fn close_peer(pc: &Arc<dyn webrtc::peer_connection::PeerConnection>) {
     if tokio::time::timeout(Duration::from_secs(10), pc.close()).await.is_err() {
         log::warn!("关闭旧连接超时，继续恢复房间");
     }

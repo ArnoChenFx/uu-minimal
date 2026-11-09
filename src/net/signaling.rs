@@ -6,6 +6,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -48,34 +49,26 @@ pub enum Event {
     Connect { capture_type: u64, ice_id: Option<String>, ice: SessionIce },
     Offer(Soac),
     Candidate(Soac),
-    /// 遥控端离开 / 房间被回收。
+    /// 遥控端离开；只清理这一条 peer，房间还能继续接下一次连接。
     Released(String),
-    /// 连接已断，需要重新建房。
+    /// 连接已断或房间被云端回收，需要重新建房。
     Closed,
 }
 
-pub struct Signaling {
-    tx: mpsc::Sender<String>,
-    tasks: Vec<tokio::task::AbortHandle>,
-}
-
-impl Drop for Signaling {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
-
-/// 无法识别 peer 的离开通知按房间退出处理，重新申请房间。
+/// 云端下发的 `released` / `left` / `leave` 分两种：带 `ice_id` 的是某个遥控端断开，
+/// 不带（或空串）的是**房间级**事件——云端已经把整个房间收掉了。
+///
+/// 后者必须当成断线处理：继续守着这个房间等 offer，设备在云端就一直显示离线，
+/// 别的机器再发起远控只会拿到 2001「被控设备不在线」，端口映射停在「正在连接」。
 fn release_event(name: &str, data: &Value) -> Event {
     let nested = data.get("data").unwrap_or(&Value::Null);
     let id = [data, nested].into_iter().flat_map(|body| ["ice_id", "iceId"].into_iter()
-        .filter_map(move |key| body.get(key))).find_map(|value| match value {
-        Value::String(id) if !id.is_empty() => Some(id.clone()),
-        Value::Number(id) => Some(id.to_string()),
-        _ => None,
-    });
+        .filter_map(move |key| body.get(key)))
+        .find_map(|value| match value {
+            Value::String(id) if !id.is_empty() => Some(id.clone()),
+            Value::Number(id) => Some(id.to_string()),
+            _ => None,
+        });
     log::info!("云端离开事件: event={name} ice_id_present={}", id.is_some());
     match id {
         Some(id) => Event::Released(id),
@@ -83,9 +76,26 @@ fn release_event(name: &str, data: &Value) -> Event {
     }
 }
 
+pub struct Signaling {
+    tx: mpsc::Sender<String>,
+    /// 读 / 写两个任务。房间级离开后要主动中止它们：
+    /// 旧 WebSocket 留着不收，云端会把这个设备的两条信令当成同一个人，
+    /// 于是新房间收到的 `leave` 又会把新连接踢掉。
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for Signaling {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 impl Signaling {
+    /// 立即拆掉链路。重建房间前必须调，不能只等 Drop（Arc 可能还被别的任务持着）。
     pub fn shutdown(&self) {
-        for task in &self.tasks { task.abort(); }
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 
     pub async fn connect(url: &str, room_token: &str, events: mpsc::Sender<Event>) -> Result<Arc<Self>, String> {
@@ -118,8 +128,9 @@ impl Signaling {
         let reader = tokio::spawn(async move {
             let mut counter = 10u64;
             let mut refresh = refresh::Refresh::new(timing);
-            // 45/46 的文本头先到，二进制附件随后单独一帧。
-            let mut pending: Option<(String, Value)> = None;
+            // 45/46 的文本头先到，二进制附件随后单独一帧。用队列而不是单槽：
+            // 两个事件头之间插进来一个 ping 之类的文本帧，单槽会把前一个头覆盖掉。
+            let mut pending: VecDeque<(String, Value)> = VecDeque::new();
             let mut window = DEFAULT_PING_WINDOW;
             let mut deadline = tokio::time::Instant::now() + window;
             loop {
@@ -193,7 +204,11 @@ impl Signaling {
                                 .unwrap_or_default()
                                 .to_owned();
                             let header = parsed.as_ref().and_then(|v| v.get(1)).cloned().unwrap_or(Value::Null);
-                            pending = Some((name, header));
+                            // 附件不会连着来两批；超过 8 个未配对的头就是异常，丢掉最老的。
+                            if pending.len() >= 8 {
+                                pending.pop_front();
+                            }
+                            pending.push_back((name, header));
                         } else if let Some(rest) = text.strip_prefix("42") {
                             let Some(Value::Array(items)) = serde_json::from_str::<Value>(rest).ok() else { continue };
                             let name = items.first().and_then(Value::as_str).unwrap_or_default();
@@ -235,7 +250,7 @@ impl Signaling {
                     Message::Binary(bytes) => {
                         // 新版 Engine.IO 附件是裸 protobuf，老 SDK 带 0x04 前缀。
                         let data: &[u8] = if bytes.first() == Some(&4) { &bytes[1..] } else { &bytes };
-                        let Some((name, header)) = pending.take() else { continue };
+                        let Some((name, header)) = pending.pop_front() else { continue };
                         if name != "be-controlled" {
                             continue;
                         }
